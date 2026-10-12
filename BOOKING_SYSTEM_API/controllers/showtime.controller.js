@@ -1,0 +1,1977 @@
+const mongoose = require("mongoose");
+const {
+  Theater,
+  Hall,
+  Movie,
+  Showtime,
+  SeatBooking,
+  Booking,
+} = require("../models");
+const { Role } = require("../data");
+const logger = require("../utils/logger");
+const { logActivity } = require("../utils/activityLogger");
+const { emitEvent } = require("../utils/socket");
+const showtimeConfig = require("../config/showtime.config");
+
+class ShowtimeController {
+  // Validate ObjectId
+  static validateObjectId(id) {
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      throw new Error("Invalid Showtime ID format");
+    }
+  }
+
+  // Helper method to calculate recommended start time with buffer
+  static calculateRecommendedTime(endTime, bufferMinutes) {
+    if (!endTime || bufferMinutes <= 0) return endTime;
+
+    const [hours, minutes] = endTime.split(":").map(Number);
+    const totalMinutes = hours * 60 + minutes + bufferMinutes;
+
+    const newHours = Math.floor(totalMinutes / 60);
+    const newMinutes = totalMinutes % 60;
+
+    return `${String(newHours).padStart(2, "0")}:${String(newMinutes).padStart(2, "0")}`;
+  }
+  // Build search query
+  static async buildSearchQuery(search) {
+    if (!search) return {};
+    return {
+      $or: [
+        { language: { $regex: search, $options: "i" } },
+        { subtitle: { $regex: search, $options: "i" } },
+        { "movie.title": { $regex: search, $options: "i" } },
+      ],
+    };
+  }
+
+  // Build filter query
+  static buildFilterQuery(filters) {
+    const query = {};
+
+    const toObjectId = (id) =>
+      mongoose.Types.ObjectId.isValid(id)
+        ? new mongoose.Types.ObjectId(id)
+        : null;
+
+    const today = new Date();
+    const todayStart = new Date(
+      today.getFullYear(),
+      today.getMonth(),
+      today.getDate(),
+    );
+    const tomorrowStart = new Date(todayStart);
+    tomorrowStart.setDate(todayStart.getDate() + 1);
+
+    // current time in HH:mm format, zero-padded
+    const currentTime = `${String(today.getHours()).padStart(2, "0")}:${String(
+      today.getMinutes(),
+    ).padStart(2, "0")}`;
+
+    const isForBooking =
+      filters.forBooking === true || filters.forBooking === "true";
+
+    /* ---------- Basic filters ---------- */
+    if (filters.status) query.status = filters.status;
+
+    const movieId = toObjectId(filters.movie_id);
+    if (movieId) query.movie_id = movieId;
+
+    const hallId = toObjectId(filters.hall_id);
+    if (hallId) query.hall_id = hallId;
+
+    /* ---------- Single date filter ---------- */
+    if (filters.show_date) {
+      const day = new Date(filters.show_date);
+      day.setHours(0, 0, 0, 0);
+
+      const nextDay = new Date(day);
+      nextDay.setDate(day.getDate() + 1);
+
+      // Booking: block past date
+      if (isForBooking && day < todayStart) {
+        query.show_date = { $gte: nextDay, $lt: nextDay }; // empty
+        return query;
+      }
+
+      query.show_date = { $gte: day, $lt: nextDay };
+
+      // Booking: today → only future times
+      if (isForBooking && day.getTime() === todayStart.getTime()) {
+        query.start_time = { $gte: currentTime };
+      }
+
+      return query;
+    }
+
+    /* ---------- Booking mode without date ---------- */
+    if (isForBooking) {
+      query.$or = [
+        // Today: only future showtimes
+        {
+          show_date: { $gte: todayStart, $lt: tomorrowStart },
+          start_time: { $gte: currentTime },
+        },
+        // Future dates: all showtimes
+        {
+          show_date: { $gte: tomorrowStart },
+        },
+      ];
+    }
+
+    // Non-booking mode → return all data
+    return query;
+  }
+
+  //1.GET ALL SHOWTIMES
+  static async getAll(req, res) {
+    try {
+      const {
+        page = 1,
+        limit = 10,
+        sortBy = "start_time",
+        sortOrder = "asc",
+        search,
+        includeDeleted = false,
+        theater_id, // Extract theater_id to handle it separately
+        ...filters
+      } = req.query;
+
+      const pageNum = Math.max(1, parseInt(page));
+      const limitNum = Math.min(100, Math.max(1, parseInt(limit)));
+      const skip = (pageNum - 1) * limitNum;
+
+      const matchQuery = { ...ShowtimeController.buildFilterQuery(filters) };
+
+      if (!includeDeleted || includeDeleted === "false") {
+        matchQuery.deletedAt = null;
+      }
+
+      const pipeline = [
+        { $match: matchQuery },
+
+        // Lookup movie
+        {
+          $lookup: {
+            from: "movies",
+            localField: "movie_id",
+            foreignField: "_id",
+            as: "movie",
+          },
+        },
+        { $unwind: { path: "$movie", preserveNullAndEmptyArrays: true } },
+
+        // Lookup hall
+        {
+          $lookup: {
+            from: "halls",
+            localField: "hall_id",
+            foreignField: "_id",
+            as: "hall",
+          },
+        },
+        { $unwind: { path: "$hall", preserveNullAndEmptyArrays: true } },
+
+        // Lookup theater from hall
+        {
+          $lookup: {
+            from: "theaters",
+            localField: "hall.theater_id",
+            foreignField: "_id",
+            as: "theater",
+          },
+        },
+        { $unwind: { path: "$theater", preserveNullAndEmptyArrays: true } },
+      ];
+
+      // Filter by theater_id after lookup
+      if (theater_id && mongoose.Types.ObjectId.isValid(theater_id)) {
+        pipeline.push({
+          $match: {
+            "hall.theater_id": new mongoose.Types.ObjectId(theater_id),
+          },
+        });
+      }
+
+      // Filter out inactive halls for booking requests
+      if (filters.forBooking === true || filters.forBooking === "true") {
+        pipeline.push({
+          $match: {
+            "hall.status": "active",
+          },
+        });
+      }
+
+      // Optional search on movie title
+      if (search) {
+        pipeline.push({
+          $match: {
+            "movie.title": { $regex: search, $options: "i" },
+          },
+        });
+      }
+
+      // Count total
+      const totalCountResult = await Showtime.aggregate([
+        ...pipeline,
+        { $count: "total" },
+      ]);
+      const totalCount = totalCountResult[0]?.total || 0;
+
+      // Sort, skip, limit
+      pipeline.push({ $sort: { [sortBy]: sortOrder === "desc" ? -1 : 1 } });
+      pipeline.push({ $skip: skip });
+      pipeline.push({ $limit: limitNum });
+
+      // Project
+      pipeline.push({
+        $project: {
+          movie: { _id: 1, title: 1, poster_url: 1, duration_minutes: 1 },
+          hall: { _id: 1, hall_name: 1, screen_type: 1 },
+          theater: { _id: 1, name: 1, province: 1, city: 1 },
+          show_date: 1,
+          start_time: 1,
+          end_time: 1,
+          status: 1,
+          createdAt: 1,
+        },
+      });
+
+      const showtimes = await Showtime.aggregate(pipeline);
+
+      const totalPages = Math.ceil(totalCount / limitNum);
+      const hasNextPage = pageNum < totalPages;
+      const hasPrevPage = pageNum > 1;
+
+      res.status(200).json({
+        success: true,
+        data: {
+          showtimes,
+          pagination: {
+            currentPage: pageNum,
+            totalPages,
+            totalCount,
+            limit: limitNum,
+            hasNextPage,
+            hasPrevPage,
+            nextPage: hasNextPage ? pageNum + 1 : null,
+            prevPage: hasPrevPage ? pageNum - 1 : null,
+          },
+        },
+      });
+    } catch (error) {
+      logger.error("Get all showtimes error:", error);
+      res
+        .status(500)
+        .json({ success: false, message: "Failed to retrieve showtimes" });
+    }
+  }
+
+  //2. GET SHOWTIME BY ID
+  static async getById(req, res) {
+    try {
+      const { id } = req.params;
+      if (!id)
+        return res
+          .status(400)
+          .json({ success: false, message: "Showtime ID is required" });
+
+      if (!mongoose.Types.ObjectId.isValid(id)) {
+        throw new Error("Invalid ID format");
+      }
+
+      const showtimeResult = await Showtime.aggregate([
+        { $match: { _id: new mongoose.Types.ObjectId(id), deletedAt: null } },
+
+        // Lookup movie
+        {
+          $lookup: {
+            from: "movies",
+            localField: "movie_id",
+            foreignField: "_id",
+            as: "movie",
+          },
+        },
+        { $unwind: { path: "$movie", preserveNullAndEmptyArrays: true } },
+
+        // Lookup hall
+        {
+          $lookup: {
+            from: "halls",
+            localField: "hall_id",
+            foreignField: "_id",
+            as: "hall",
+          },
+        },
+        { $unwind: { path: "$hall", preserveNullAndEmptyArrays: true } },
+
+        // Lookup theater from hall
+        {
+          $lookup: {
+            from: "theaters",
+            localField: "hall.theater_id",
+            foreignField: "_id",
+            as: "theater",
+          },
+        },
+        { $unwind: { path: "$theater", preserveNullAndEmptyArrays: true } },
+
+        {
+          $project: {
+            movie: { _id: 1, title: 1, poster_url: 1, duration_minutes: 1 },
+            hall: { _id: 1, hall_name: 1, screen_type: 1 },
+            theater: { _id: 1, name: 1, province: 1, city: 1 },
+            show_date: 1,
+            start_time: 1,
+            end_time: 1,
+            status: 1,
+            createdAt: 1,
+          },
+        },
+      ]);
+
+      if (!showtimeResult || showtimeResult.length === 0) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Showtime not found" });
+      }
+
+      res
+        .status(200)
+        .json({ success: true, data: { showtime: showtimeResult[0] } });
+    } catch (error) {
+      if (error.message === "Invalid ID format") {
+        return res.status(400).json({ success: false, message: error.message });
+      }
+      logger.error("Get showtime by ID error:", error);
+      res
+        .status(500)
+        .json({ success: false, message: "Failed to retrieve showtime" });
+    }
+  }
+
+  // 3. CREATE SHOWTIME
+  static async create(req, res) {
+    try {
+      const showTimeData = req.body;
+      const { movie_id, hall_id, show_date, start_time } = showTimeData;
+
+      // Basic validation
+      if (!movie_id || !hall_id || !show_date || !start_time) {
+        return res.status(400).json({
+          success: false,
+          message: "movie_id, hall_id, show_date, and start_time are required.",
+        });
+      }
+
+      // Validate time format
+      const timeRegex = /^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/;
+      if (!timeRegex.test(start_time)) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Invalid start_time format. Please use HH:MM format (e.g., 14:30).",
+        });
+      }
+
+      // Enhanced past time validation with better error message
+      const pastValidation = Showtime.validateNotInPast(show_date, start_time);
+      if (!pastValidation.isValid) {
+        return res.status(400).json({
+          success: false,
+          message: "Cannot create showtime in the past.",
+          details: pastValidation.message,
+        });
+      }
+
+      // Check if referenced documents exist and are active
+      const [movie, hall] = await Promise.all([
+        Movie.findOne({ _id: movie_id, deletedAt: null }),
+        Hall.findOne({ _id: hall_id, deletedAt: null }),
+      ]);
+
+      if (!movie) {
+        return res.status(404).json({
+          success: false,
+          message: "Movie not found or has been deleted.",
+        });
+      }
+      if (!hall) {
+        return res.status(404).json({
+          success: false,
+          message: "Hall not found or has been deleted.",
+        });
+      }
+
+      // Check if hall is active
+      if (hall.status !== "active") {
+        return res.status(409).json({
+          success: false,
+          message: `Cannot create showtime for hall "${hall.hall_name}". Hall status is "${hall.status}". Only active halls can have showtimes.`,
+        });
+      }
+
+      if (movie.status === "ended") {
+        return res.status(409).json({
+          success: false,
+          message: "Cannot create showtime for a movie that has ended.",
+        });
+      }
+
+      // Calculate end_time for pre-validation
+      let end_time = showTimeData.end_time;
+      if (!end_time && movie.duration_minutes) {
+        const normalizedDate = Showtime.safeNormalizeDate(show_date);
+        const [hours, minutes] = start_time.split(":").map(Number);
+        const startDateTime = new Date(
+          Date.UTC(
+            normalizedDate.getUTCFullYear(),
+            normalizedDate.getUTCMonth(),
+            normalizedDate.getUTCDate(),
+            hours,
+            minutes,
+          ),
+        );
+        const endDateTime = new Date(
+          startDateTime.getTime() + movie.duration_minutes * 60000,
+        );
+        end_time = `${String(endDateTime.getUTCHours()).padStart(2, "0")}:${String(endDateTime.getUTCMinutes()).padStart(2, "0")}`;
+      }
+
+      // Pre-validate time slot availability with buffer time
+      if (end_time) {
+        const bufferTime = showtimeConfig.VALIDATION.ENFORCE_BUFFER
+          ? showtimeConfig.BUFFER_TIME_MINUTES
+          : 0;
+        const validation = await Showtime.canCreateShowtimeAt(
+          hall_id,
+          show_date,
+          start_time,
+          end_time,
+          null, // No exclusion for new showtime
+          bufferTime,
+        );
+
+        if (!validation.canCreate) {
+          return res.status(409).json({
+            success: false,
+            message: `Time slot conflict in hall "${hall.hall_name}"`,
+            details: validation.message,
+            conflictingShowtime: validation.conflictingShowtime,
+            bufferTime: validation.bufferApplied || 0,
+            suggestions: {
+              message: `Try scheduling at least ${bufferTime} minutes after the conflicting showtime ends`,
+              earliestAvailableTime: validation.conflictingShowtime.end_time,
+              recommendedStartTime: this.calculateRecommendedTime(
+                validation.conflictingShowtime.end_time,
+                bufferTime,
+              ),
+            },
+          });
+        }
+      }
+
+      // Prepare and save the new showtime
+      const showtimeToCreate = { ...showTimeData };
+      if (req.user) {
+        showtimeToCreate.createdBy = req.user.userId;
+      }
+
+      const showtime = new Showtime(showtimeToCreate);
+      await showtime.save();
+
+      logger.info(`Created new showtime: ${showtime._id}`);
+
+      // Log Activity
+      await logActivity({
+        userId: req.user?.userId,
+        action: "SHOWTIME_CREATE",
+        targetId: showtime._id,
+        req,
+        metadata: {
+          movie_id: showtime.movie_id,
+          hall_id: showtime.hall_id,
+          show_date: showtime.show_date,
+          start_time: showtime.start_time,
+          end_time: showtime.end_time,
+        },
+      });
+
+      // Notify via Socket.io
+      emitEvent("showtime:created", { showtime: showtime.toObject() });
+
+      // Send success response
+      res.status(201).json({
+        success: true,
+        message: "Showtime created successfully",
+        data: { showtime },
+      });
+    } catch (error) {
+      // Handle known validation errors from the model's pre-save hook
+      if (
+        error.message.includes("cannot be scheduled in the past") ||
+        error.message.includes("Showtime cannot be scheduled in the past")
+      ) {
+        return res.status(409).json({
+          success: false,
+          message: "Cannot create showtime in the past",
+          details: error.message,
+        });
+      }
+      if (
+        error.message.includes("conflict") ||
+        error.message.includes("overlaps")
+      ) {
+        return res.status(409).json({
+          success: false,
+          message: "Showtime scheduling conflict",
+          details: error.message,
+        });
+      }
+
+      if (error.name === "ValidationError") {
+        return res.status(400).json({
+          success: false,
+          message: "Validation failed",
+          errors: error.message,
+        });
+      }
+
+      logger.error("Create showtime error:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to create showtime",
+      });
+    }
+  }
+
+  // 4. UPDATE SHOWTIME
+  static async update(req, res) {
+    try {
+      const { id } = req.params;
+      const updateData = req.body;
+
+      if (!mongoose.Types.ObjectId.isValid(id)) {
+        throw new Error("Invalid Showtime ID format");
+      }
+
+      const showtime = await Showtime.findById(id);
+      if (!showtime) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Showtime not found" });
+      }
+
+      // Check if showtime is completed - limit what can be updated
+      if (
+        showtime.status === "completed" &&
+        showtimeConfig.COMPLETED_SHOWTIME_PROTECTION.PREVENT_MODIFY
+      ) {
+        // Only allow specific fields to be updated for completed showtimes
+        const allowedFields =
+          showtimeConfig.COMPLETED_SHOWTIME_PROTECTION.ALLOWED_UPDATE_FIELDS;
+        const updateFields = Object.keys(updateData);
+        const unauthorizedFields = updateFields.filter(
+          (field) => !allowedFields.includes(field),
+        );
+
+        if (unauthorizedFields.length > 0) {
+          return res.status(409).json({
+            success: false,
+            message:
+              "Cannot modify completed showtime details. Only specific fields are allowed for completed showtimes.",
+            details: {
+              showtimeId: id,
+              currentStatus: showtime.status,
+              attemptedFields: updateFields,
+              unauthorizedFields: unauthorizedFields,
+              allowedFields: allowedFields,
+              reason:
+                "Completed showtimes are protected to maintain historical accuracy and audit trail.",
+              configSetting:
+                "COMPLETED_SHOWTIME_PROTECTION.PREVENT_MODIFY = true",
+            },
+          });
+        }
+      }
+
+      // Validate time format if start_time is being updated
+      if (updateData.start_time) {
+        const timeRegex = /^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/;
+        if (!timeRegex.test(updateData.start_time)) {
+          return res.status(400).json({
+            success: false,
+            message:
+              "Invalid start_time format. Please use HH:MM format (e.g., 14:30).",
+          });
+        }
+      }
+
+      // Enhanced past time validation
+      if (updateData.show_date || updateData.start_time) {
+        const checkDate = updateData.show_date || showtime.show_date;
+        const checkTime = updateData.start_time || showtime.start_time;
+
+        const pastValidation = Showtime.validateNotInPast(checkDate, checkTime);
+        if (!pastValidation.isValid) {
+          return res.status(409).json({
+            success: false,
+            message: "Cannot update showtime to a past date/time",
+            details: pastValidation.message,
+          });
+        }
+      }
+
+      // If updating movie_id, hall_id, date, or time, do pre-validation
+      if (
+        updateData.movie_id ||
+        updateData.hall_id ||
+        updateData.show_date ||
+        updateData.start_time
+      ) {
+        const checkMovieId = updateData.movie_id || showtime.movie_id;
+        const checkHallId = updateData.hall_id || showtime.hall_id;
+        const checkDate = updateData.show_date || showtime.show_date;
+        const checkStartTime = updateData.start_time || showtime.start_time;
+
+        // Validate referenced documents
+        const [movie, hall] = await Promise.all([
+          Movie.findOne({ _id: checkMovieId, deletedAt: null }),
+          Hall.findOne({ _id: checkHallId, deletedAt: null }),
+        ]);
+
+        if (!movie) {
+          return res.status(404).json({
+            success: false,
+            message: "Movie not found or has been deleted.",
+          });
+        }
+        if (!hall) {
+          return res.status(404).json({
+            success: false,
+            message: "Hall not found or has been deleted.",
+          });
+        }
+
+        if (hall.status !== "active") {
+          return res.status(409).json({
+            success: false,
+            message: `Cannot update showtime for hall "${hall.hall_name}". Hall status is "${hall.status}". Only active halls can have showtimes.`,
+          });
+        }
+
+        if (movie.status === "ended") {
+          return res.status(409).json({
+            success: false,
+            message: "Cannot update showtime for a movie that has ended.",
+          });
+        }
+
+        // Calculate end_time for pre-validation
+        let checkEndTime = updateData.end_time || showtime.end_time;
+        if (!checkEndTime && movie.duration_minutes) {
+          const normalizedDate = Showtime.safeNormalizeDate(checkDate);
+          const [hours, minutes] = checkStartTime.split(":").map(Number);
+          const startDateTime = new Date(
+            Date.UTC(
+              normalizedDate.getUTCFullYear(),
+              normalizedDate.getUTCMonth(),
+              normalizedDate.getUTCDate(),
+              hours,
+              minutes,
+            ),
+          );
+          const endDateTime = new Date(
+            startDateTime.getTime() + movie.duration_minutes * 60000,
+          );
+          checkEndTime = `${String(endDateTime.getUTCHours()).padStart(2, "0")}:${String(endDateTime.getUTCMinutes()).padStart(2, "0")}`;
+        }
+
+        // Pre-validate time slot availability with buffer time
+        if (checkEndTime) {
+          const bufferTime = showtimeConfig.VALIDATION.ENFORCE_BUFFER
+            ? showtimeConfig.BUFFER_TIME_MINUTES
+            : 0;
+          const validation = await Showtime.canCreateShowtimeAt(
+            checkHallId,
+            checkDate,
+            checkStartTime,
+            checkEndTime,
+            showtime._id, // Exclude current showtime from conflict check
+            bufferTime,
+          );
+
+          if (!validation.canCreate) {
+            return res.status(409).json({
+              success: false,
+              message: `Time slot conflict in hall "${hall.hall_name}"`,
+              details: validation.message,
+              conflictingShowtime: validation.conflictingShowtime,
+              bufferTime: validation.bufferApplied || 0,
+              suggestions: {
+                message: `Try scheduling at least ${bufferTime} minutes after the conflicting showtime ends`,
+                earliestAvailableTime: validation.conflictingShowtime.end_time,
+                recommendedStartTime:
+                  ShowtimeController.calculateRecommendedTime(
+                    validation.conflictingShowtime.end_time,
+                    bufferTime,
+                  ),
+              },
+            });
+          }
+        }
+      }
+
+      // Update fields
+      Object.assign(showtime, updateData);
+      if (req.user) {
+        showtime.updatedBy = req.user.userId;
+      }
+
+      // .save() will trigger the pre-save hook which handles end_time calculation and overlap validation
+      const updatedShowtime = await showtime.save();
+
+      logger.info(`Updated showtime: ${id}`);
+
+      // Log Activity
+      await logActivity({
+        userId: req.user?.userId,
+        action: "SHOWTIME_UPDATE",
+        targetId: updatedShowtime._id,
+        req,
+        metadata: {
+          movie_id: updatedShowtime.movie_id,
+          hall_id: updatedShowtime.hall_id,
+          show_date: updatedShowtime.show_date,
+          start_time: updatedShowtime.start_time,
+          end_time: updatedShowtime.end_time,
+          updatedFields: Object.keys(updateData),
+        },
+      });
+
+      // Notify via Socket.io
+      emitEvent("showtime:updated", { showtime: updatedShowtime.toObject() });
+
+      res.status(200).json({
+        success: true,
+        message: "Showtime updated successfully",
+        data: { showtime: updatedShowtime },
+      });
+    } catch (error) {
+      // Handle known validation errors from the model's pre-save hook
+      if (
+        error.message.includes("cannot be scheduled in the past") ||
+        error.message.includes("Showtime cannot be scheduled in the past")
+      ) {
+        return res.status(409).json({
+          success: false,
+          message: "Cannot update showtime to a past date/time",
+          details: error.message,
+        });
+      }
+      if (
+        error.message.includes("conflict") ||
+        error.message.includes("overlaps")
+      ) {
+        return res.status(409).json({
+          success: false,
+          message: "Showtime scheduling conflict",
+          details: error.message,
+        });
+      }
+
+      if (error.name === "ValidationError") {
+        // This will now catch Mongoose validation errors from .save()
+        return res.status(400).json({
+          success: false,
+          message: "Validation failed",
+          errors: error.message,
+        });
+      }
+      logger.error("Update showtime error:", error);
+      res
+        .status(500)
+        .json({ success: false, message: "Failed to update showtime" });
+    }
+  }
+
+  // 5. SOFT DELETE SHOWTIME
+  static async delete(req, res) {
+    try {
+      const { id } = req.params;
+
+      if (!id) {
+        return res.status(400).json({
+          success: false,
+          message: "Showtime ID is required",
+        });
+      }
+      if (!mongoose.Types.ObjectId.isValid(id)) {
+        throw new Error("Invalid Showtime ID format");
+      }
+
+      const showtime = await Showtime.findById(id);
+      if (!showtime) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Showtime not found" });
+      }
+
+      // Check if showtime is completed - completed showtimes cannot be deleted
+      if (
+        showtime.status === "completed" &&
+        showtimeConfig.COMPLETED_SHOWTIME_PROTECTION.PREVENT_DELETE
+      ) {
+        return res.status(409).json({
+          success: false,
+          message:
+            "Cannot delete completed showtime. Completed showtimes are protected for historical records and audit purposes.",
+          details: {
+            showtimeId: id,
+            status: showtime.status,
+            showDate: showtime.show_date,
+            startTime: showtime.start_time,
+            reason:
+              "Completed showtimes contain important historical data and should be preserved for reporting and audit purposes.",
+            configSetting:
+              "COMPLETED_SHOWTIME_PROTECTION.PREVENT_DELETE = true",
+          },
+        });
+      }
+
+      // Check for associated active bookings before deactivating
+      if (Booking) {
+        const activeBookings = await Booking.countDocuments({
+          showtimeId: id,
+          booking_status: { $nin: ["Cancelled"] }, // Check for bookings that are not cancelled
+          deletedAt: null,
+        });
+
+        if (activeBookings > 0) {
+          return res.status(409).json({
+            success: false,
+            message: `Cannot deactivate showtime. It has ${activeBookings} active booking(s). Please cancel or resolve them first.`,
+          });
+        }
+      } else {
+        logger.warn(
+          `Booking model not found. Skipping check for associated bookings on showtime deletion. ID: ${id}`,
+        );
+      }
+      // Check if showtime is already soft deleted
+      if (showtime.isDeleted()) {
+        return res.status(409).json({
+          success: false,
+          message: "Showtime is already deactivated",
+        });
+      }
+      await showtime.softDelete(req.user?.userId);
+
+      logger.info(`Soft deleted showtime: ${id}`);
+
+      // Log Activity
+      await logActivity({
+        userId: req.user?.userId,
+        action: "SHOWTIME_DELETE",
+        targetId: showtime._id,
+        req,
+        metadata: {
+          movie_id: showtime.movie_id,
+          hall_id: showtime.hall_id,
+          show_date: showtime.show_date,
+        },
+      });
+
+      // Notify via Socket.io
+      emitEvent("showtime:deleted", { id });
+
+      res.status(200).json({
+        success: true,
+        message: "Showtime deactivated successfully",
+        data: { showtime },
+      });
+    } catch (error) {
+      logger.error("Delete showtime error:", error);
+      res
+        .status(500)
+        .json({ success: false, message: "Failed to deactivate showtime" });
+    }
+  }
+
+  // 6. RESTORE SHOWTIME
+  static async restore(req, res) {
+    try {
+      const { id } = req.params;
+      ShowtimeController.validateObjectId(id);
+
+      // Find among deleted documents
+      const showtime = await Showtime.findOne({
+        _id: id,
+        deletedAt: { $ne: null },
+      });
+      if (!showtime) {
+        return res.status(404).json({
+          success: false,
+          message: "Showtime not found or is not deleted.",
+        });
+      }
+
+      // When restoring, check for conflicts as if it were a new showtime
+      const overlapping = await Showtime.findOverlappingShowtimes(
+        showtime.hall_id,
+        showtime.show_date,
+        showtime.start_time,
+        showtime.end_time,
+      );
+
+      if (overlapping.length > 0) {
+        return res.status(409).json({
+          success: false,
+          message:
+            "Cannot restore showtime because it overlaps with an existing active showtime.",
+          data: { overlappingShowtimes: overlapping },
+        });
+      }
+
+      await showtime.restore(req.user?.userId);
+
+      logger.info(`Restored showtime: ${id}`);
+
+      // Log Activity
+      await logActivity({
+        userId: req.user?.userId,
+        action: "SHOWTIME_RESTORE",
+        targetId: showtime._id,
+        req,
+        metadata: {
+          movie_id: showtime.movie_id,
+          hall_id: showtime.hall_id,
+          show_date: showtime.show_date,
+        },
+      });
+
+      // Notify via Socket.io
+      emitEvent("showtime:restored", { showtime });
+
+      res.status(200).json({
+        success: true,
+        message: "Showtime restored successfully",
+        data: { showtime },
+      });
+    } catch (error) {
+      logger.error("Restore showtime error:", error);
+      res
+        .status(500)
+        .json({ success: false, message: "Failed to restore showtime" });
+    }
+  }
+
+  // 7. FORCE DELETE SHOWTIME (Permanent)
+  static async forceDelete(req, res) {
+    try {
+      const { id } = req.params;
+      ShowtimeController.validateObjectId(id);
+
+      // 1. Authorization: Admin/SuperAdmin only
+      if (req.user?.role !== Role.ADMIN && req.user?.role !== Role.SUPERADMIN) {
+        return res.status(403).json({
+          success: false,
+          message:
+            "Forbidden: Only Admins or SuperAdmins can permanently delete showtimes.",
+        });
+      }
+
+      // 2. Find the showtime (including soft-deleted ones)
+      const showtime = await Showtime.collection.findOne({
+        _id: new mongoose.Types.ObjectId(id),
+      });
+      if (!showtime) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Showtime not found" });
+      }
+
+      // 3. Strict check for any associated bookings
+      if (Booking) {
+        const bookingCount = await Booking.countDocuments({ showtimeId: id });
+        if (bookingCount > 0) {
+          return res.status(409).json({
+            success: false,
+            message: `Cannot permanently delete showtime. It has ${bookingCount} associated booking(s). Please permanently delete them first.`,
+          });
+        }
+      } else {
+        logger.warn(
+          `Booking model not found. Skipping check for associated bookings on showtime force deletion. ID: ${id}`,
+        );
+      }
+
+      // 4. Perform permanent deletion
+      // Delete associated SeatBooking records
+      await SeatBooking.deleteMany({ showtimeId: id });
+      logger.info(
+        `Deleted SeatBooking records for permanently deleted showtime ID: ${id}`,
+      );
+
+      await Showtime.findByIdAndDelete(id);
+
+      logger.warn(
+        `PERMANENT DELETION: Showtime permanently deleted by ${req.user.role} ${req.user.userId}`,
+        {
+          deletedShowtime: {
+            id: showtime._id,
+            movie_id: showtime.movie_id,
+            hall_id: showtime.hall_id,
+            start_time: showtime.start_time,
+          },
+          deletedBy: req.user.userId,
+          deletedAt: new Date().toISOString(),
+        },
+      );
+
+      // Log Activity
+      await logActivity({
+        userId: req.user?.userId,
+        action: "SHOWTIME_FORCE_DELETE",
+        targetId: showtime._id,
+        req,
+        metadata: {
+          movie_id: showtime.movie_id,
+          hall_id: showtime.hall_id,
+          show_date: showtime.show_date,
+        },
+      });
+
+      res.status(200).json({
+        success: true,
+        message: "Showtime permanently deleted.",
+        data: {
+          deletedShowtimeId: id,
+          warning: "This action is irreversible.",
+        },
+      });
+    } catch (error) {
+      logger.error("Force delete showtime error:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to permanently delete showtime",
+      });
+    }
+  }
+
+  // 8. LIST DELETED SHOWTIMES
+  static async listDeleted(req, res) {
+    try {
+      o;
+      const {
+        page = 1,
+        limit = 10,
+        sortBy = "deletedAt",
+        sortOrder = "desc",
+      } = req.query;
+
+      const pageNum = Math.max(1, parseInt(page));
+      const limitNum = Math.min(100, Math.max(1, parseInt(limit)));
+      const skip = (pageNum - 1) * limitNum;
+
+      const query = { deletedAt: { $ne: null } };
+      const sortObj = { [sortBy]: sortOrder === "desc" ? -1 : 1 };
+
+      const [showtimes, totalCount] = await Promise.all([
+        Showtime.find(query)
+          .sort(sortObj)
+          .skip(skip)
+          .limit(limitNum)
+          .populate({ path: "movie_id", select: "title" })
+          .populate({ path: "hall_id", select: "hall_name" })
+          .lean(),
+        Showtime.countDocuments(query),
+      ]);
+
+      const totalPages = Math.ceil(totalCount / limitNum);
+
+      logger.info(`Retrieved ${showtimes.length} deleted showtimes`);
+
+      res.status(200).json({
+        success: true,
+        data: {
+          showtimes,
+          pagination: {
+            currentPage: pageNum,
+            totalPages,
+            totalCount,
+            limit: limitNum,
+          },
+        },
+      });
+    } catch (error) {
+      logger.error("Get deleted showtimes error:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to retrieve deleted showtimes",
+      });
+    }
+  }
+
+  // 9. UPDATE SHOWTIME STATUS
+  static async updateStatus(req, res) {
+    try {
+      const { id } = req.params;
+      const { status } = req.body;
+
+      ShowtimeController.validateObjectId(id);
+
+      if (!status) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Status is required" });
+      }
+
+      const showtime = await Showtime.findById(id);
+      if (!showtime) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Showtime not found" });
+      }
+
+      if (showtime.isDeleted()) {
+        return res.status(409).json({
+          success: false,
+          message:
+            "Cannot update status of a deactivated showtime. Please restore it first.",
+        });
+      }
+
+      const updatedShowtime = await showtime.updateStatus(
+        status,
+        req.user?.userId,
+      );
+
+      logger.info(`Updated showtime status: ${id} to ${status}`);
+
+      // Log Activity
+      await logActivity({
+        userId: req.user?.userId,
+        action: "SHOWTIME_STATUS_UPDATE",
+        targetId: updatedShowtime._id,
+        req,
+        metadata: {
+          movie_id: updatedShowtime.movie_id,
+          status: status,
+        },
+      });
+
+      res.status(200).json({
+        success: true,
+        message: "Showtime status updated successfully",
+        data: { showtime },
+      });
+    } catch (error) {
+      if (error.message === "Invalid showtime ID format") {
+        return res.status(400).json({ success: false, message: error.message });
+      }
+      if (error.message === "Invalid status provided") {
+        return res.status(400).json({
+          success: false,
+          message: error.message,
+        });
+      }
+      logger.error("Update showtime status error:", error);
+      res
+        .status(500)
+        .json({ success: false, message: "Failed to update showtime status" });
+    }
+  }
+
+  // 10. GET SHOWTIME ANALYTICS
+  static async getAnalytics(req, res) {
+    try {
+      const analytics = await Showtime.getAnalytics(req.query);
+      logger.info("Retrieved showtime analytics");
+      res.status(200).json({
+        success: true,
+        data: { analytics },
+      });
+    } catch (error) {
+      logger.error("Get showtime analytics error:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to retrieve showtime analytics",
+      });
+    }
+  }
+
+  // 10.1. VALIDATE SHOWTIME INTEGRITY
+  static async validateIntegrity(req, res) {
+    try {
+      const validation = await Showtime.validateIntegrity();
+
+      if (validation.isValid) {
+        logger.info("Showtime integrity validation passed");
+        res.status(200).json({
+          success: true,
+          message: "All showtimes are valid",
+          data: { validation },
+        });
+      } else {
+        logger.warn("Showtime integrity issues found", {
+          issues: validation.issues,
+        });
+        res.status(200).json({
+          success: true,
+          message: validation.summary,
+          data: { validation },
+          warning:
+            "Integrity issues found - see data.validation.issues for details",
+        });
+      }
+    } catch (error) {
+      logger.error("Validate showtime integrity error:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to validate showtime integrity",
+      });
+    }
+  }
+
+  // 11. BULK CREATE SHOWTIMES
+  static async createBulk(req, res) {
+    try {
+      const { showtimes } = req.body;
+      const userId = req.user?.userId;
+
+      if (!showtimes || !Array.isArray(showtimes) || showtimes.length === 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Request body must contain a non-empty array of showtimes.",
+        });
+      }
+
+      const errors = [];
+      const batchKeys = new Set(); // To track duplicates within the batch
+
+      // 1. Validate each showtime
+      for (let i = 0; i < showtimes.length; i++) {
+        const s = showtimes[i];
+        const { movie_id, hall_id, show_date, start_time } = s;
+
+        // Check required fields
+        if (!movie_id || !hall_id || !show_date || !start_time) {
+          errors.push({
+            index: i,
+            error: `Row ${i + 1}: Missing required fields (Movie, Hall, Date, or Start Time).`,
+          });
+          continue;
+        }
+
+        // Check movie and hall
+        const [movie, hall] = await Promise.all([
+          Movie.findOne({ _id: movie_id, deletedAt: null }, null, {
+            skipAutoUpdate: true,
+          }),
+          Hall.findOne({ _id: hall_id, deletedAt: null }),
+        ]);
+
+        if (!movie) errors.push({ index: i, error: "Movie not found." });
+        else if (movie.status === "ended")
+          errors.push({ index: i, error: "Movie has ended." });
+
+        if (!hall) errors.push({ index: i, error: "Hall not found." });
+        else if (hall.status !== "active")
+          errors.push({
+            index: i,
+            error: `Hall "${hall.hall_name}" is not active (status: ${hall.status}). Only active halls can have showtimes.`,
+          });
+
+        // Check duplicates in this batch
+        const key = `${hall_id}_${show_date}_${start_time}`;
+        if (batchKeys.has(key)) {
+          errors.push({
+            index: i,
+            error: `Row ${i + 1}: Duplicate showtime (${start_time}) already exists in your selection.`,
+          });
+        } else {
+          batchKeys.add(key);
+        }
+
+        // Safety Check: Prevent accidental creation of past showtimes in bulk create
+        const showtimeDate = new Date(show_date);
+        const [hours, minutes] = start_time.split(":").map(Number);
+        const localStartDateTime = new Date(
+          showtimeDate.getFullYear(),
+          showtimeDate.getMonth(),
+          showtimeDate.getDate(),
+          hours,
+          minutes,
+        );
+
+        if (localStartDateTime < new Date()) {
+          errors.push({
+            index: i,
+            error: `Row ${i + 1}: Showtime at ${start_time} is in the past. Please choose a future date/time.`,
+          });
+        }
+      }
+
+      // 2. Check duplicates in database
+      if (errors.length === 0) {
+        const dbConditions = showtimes.map((s) => ({
+          hall_id: s.hall_id,
+          show_date: s.show_date,
+          start_time: s.start_time,
+        }));
+
+        const existing = await Showtime.find({ $or: dbConditions }).lean();
+
+        if (existing.length > 0) {
+          existing.forEach((e) => {
+            const idx = showtimes.findIndex(
+              (s) =>
+                s.hall_id.toString() === e.hall_id.toString() &&
+                Showtime.safeNormalizeDate(s.show_date).toISOString() ===
+                  Showtime.safeNormalizeDate(e.show_date).toISOString() &&
+                s.start_time === e.start_time,
+            );
+            errors.push({
+              index: idx,
+              error: `Row ${idx + 1}: Showtime at ${e.start_time} already exists in the database for this hall and date.`,
+            });
+          });
+        }
+      }
+
+      // 3. Abort if any errors
+      if (errors.length > 0) {
+        return res.status(409).json({
+          success: false,
+          message: "Bulk creation aborted due to errors.",
+          errors,
+        });
+      }
+
+      // 4. Create all showtimes (using individual save() to trigger validation)
+      const showtimesToCreate = showtimes.map((s) => ({
+        ...s,
+        createdBy: userId,
+      }));
+
+      const createdShowtimes = [];
+      const creationErrors = [];
+
+      // Create each showtime individually to ensure validation runs
+      for (let i = 0; i < showtimesToCreate.length; i++) {
+        try {
+          const showtime = new Showtime(showtimesToCreate[i]);
+          const savedShowtime = await showtime.save(); // This triggers pre-save validation
+          createdShowtimes.push(savedShowtime);
+        } catch (error) {
+          creationErrors.push({
+            index: i,
+            showtime: showtimesToCreate[i],
+            error: error.message,
+          });
+        }
+      }
+
+      // If any creation errors occurred, return them
+      if (creationErrors.length > 0) {
+        return res.status(409).json({
+          success: false,
+          message:
+            "Some showtimes could not be created due to validation errors.",
+          data: {
+            createdCount: createdShowtimes.length,
+            failedCount: creationErrors.length,
+            createdShowtimes,
+            errors: creationErrors,
+          },
+        });
+      }
+
+      // Log Activity
+      const movieIds = [
+        ...new Set(createdShowtimes.map((s) => s.movie_id.toString())),
+      ];
+      const hallIds = [
+        ...new Set(createdShowtimes.map((s) => s.hall_id.toString())),
+      ];
+
+      const [movies, halls] = await Promise.all([
+        Movie.find({ _id: { $in: movieIds } }, "title", {
+          skipAutoUpdate: true,
+        }).lean(),
+        Hall.find({ _id: { $in: hallIds } }, "hall_name").lean(),
+      ]);
+
+      await logActivity({
+        userId: req.user?.userId,
+        action: "SHOWTIME_CREATE",
+        req,
+        metadata: {
+          bulk: true,
+          count: createdShowtimes.length,
+          showtimeIds: createdShowtimes.map((s) => s._id),
+          movieTitles: movies.map((m) => m.title),
+          hallNames: halls.map((h) => h.hall_name),
+          dates: [...new Set(createdShowtimes.map((s) => s.show_date))],
+        },
+      });
+
+      // Notify via Socket.io
+      emitEvent("showtime:created", {
+        count: createdShowtimes.length,
+        showtimes: createdShowtimes.map((s) => s.toObject()),
+      });
+
+      res.status(201).json({
+        success: true,
+        message: "All showtimes created successfully.",
+        data: { createdCount: createdShowtimes.length, createdShowtimes },
+      });
+    } catch (error) {
+      console.error("Bulk create showtime error:", error);
+      res.status(500).json({
+        success: false,
+        message: "Unexpected error during bulk creation.",
+      });
+    }
+  }
+
+  // 12. BULK SOFT DELETE SHOWTIMES
+  static async deleteBulk(req, res) {
+    try {
+      const { showtimeIds } = req.body;
+
+      if (
+        !showtimeIds ||
+        !Array.isArray(showtimeIds) ||
+        showtimeIds.length === 0
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Request body must contain a non-empty array of showtime IDs.",
+        });
+      }
+
+      const deletedShowtimes = [];
+      const errors = [];
+      const deletedBy = req.user?.userId;
+
+      // Fetch all candidate showtimes at once to reduce DB calls
+      const validIds = showtimeIds.filter((id) => {
+        if (mongoose.Types.ObjectId.isValid(id)) {
+          return true;
+        }
+        errors.push({ id, error: "Invalid ID format." });
+        return false;
+      });
+
+      const showtimes = await Showtime.find({ _id: { $in: validIds } });
+      const showtimeMap = new Map(showtimes.map((s) => [s._id.toString(), s]));
+
+      for (const id of validIds) {
+        const showtime = showtimeMap.get(id);
+
+        if (!showtime) {
+          errors.push({ id, error: "Showtime not found." });
+          continue;
+        }
+
+        if (showtime.isDeleted()) {
+          errors.push({ id, error: "Showtime is already deactivated." });
+          continue;
+        }
+
+        // Check if showtime is completed - completed showtimes cannot be deleted
+        if (
+          showtime.status === "completed" &&
+          showtimeConfig.COMPLETED_SHOWTIME_PROTECTION.PREVENT_DELETE
+        ) {
+          errors.push({
+            id,
+            error:
+              "Cannot delete completed showtime. Completed showtimes are protected for historical records and audit purposes.",
+          });
+          continue;
+        }
+
+        // Check for active bookings
+        const activeBookings = await Booking.countDocuments({
+          showtimeId: id,
+          booking_status: { $nin: ["Cancelled"] },
+          deletedAt: null,
+        });
+
+        if (activeBookings > 0) {
+          errors.push({
+            id,
+            error: `Cannot deactivate showtime. It has ${activeBookings} active booking(s).`,
+          });
+          continue;
+        }
+
+        await showtime.softDelete(deletedBy);
+        deletedShowtimes.push(id);
+      }
+
+      if (errors.length > 0) {
+        logger.warn("Bulk delete showtime encountered errors:", { errors });
+        return res.status(409).json({
+          success: false,
+          message: "Some showtimes could not be deactivated.",
+          data: {
+            deletedCount: deletedShowtimes.length,
+            failedCount: errors.length,
+            deletedShowtimeIds: deletedShowtimes,
+            errors,
+          },
+        });
+      }
+
+      logger.info(`Bulk deactivated ${deletedShowtimes.length} showtimes.`);
+
+      // Log Activity
+      if (deletedShowtimes.length > 0) {
+        // Fetch showtime details for enriched logging (including soft-deleted ones)
+        const showtimeDetails = await Showtime.find({
+          _id: { $in: deletedShowtimes },
+        })
+          .populate("movie_id", "title")
+          .populate("hall_id", "hall_name")
+          .lean();
+
+        await logActivity({
+          userId: req.user?.userId,
+          action: "SHOWTIME_DELETE",
+          req,
+          metadata: {
+            bulk: true,
+            count: deletedShowtimes.length,
+            showtimeIds: deletedShowtimes,
+            movieTitles: [
+              ...new Set(
+                showtimeDetails.map((s) => s.movie_id?.title).filter(Boolean),
+              ),
+            ],
+            hallNames: [
+              ...new Set(
+                showtimeDetails
+                  .map((s) => s.hall_id?.hall_name)
+                  .filter(Boolean),
+              ),
+            ],
+            dates: [...new Set(showtimeDetails.map((s) => s.show_date))],
+          },
+        });
+      }
+
+      // Notify via Socket.io
+      emitEvent("showtime:deleted", {
+        count: deletedShowtimes.length,
+        ids: deletedShowtimes,
+      });
+
+      res.status(200).json({
+        success: true,
+        message: "All specified showtimes deactivated successfully.",
+        data: {
+          deletedCount: deletedShowtimes.length,
+          deletedShowtimeIds: deletedShowtimes,
+        },
+      });
+    } catch (error) {
+      logger.error("Bulk delete showtime error:", error);
+      res.status(500).json({
+        success: false,
+        message: "An unexpected error occurred during bulk deactivation.",
+      });
+    }
+  }
+
+  // 13. BULK FORCE DELETE SHOWTIMES (Permanent)
+  static async forceDeleteBulk(req, res) {
+    try {
+      logger.info("Force delete bulk request received", { body: req.body });
+      const { showtimeIds } = req.body;
+
+      // Validate input
+      if (
+        !showtimeIds ||
+        !Array.isArray(showtimeIds) ||
+        showtimeIds.length === 0
+      ) {
+        logger.warn("Invalid showtime IDs array", { showtimeIds });
+        return res.status(400).json({
+          success: false,
+          message:
+            "Request body must contain a non-empty array of showtime IDs.",
+        });
+      }
+
+      // Authorization check
+      if (req.user?.role !== Role.ADMIN && req.user?.role !== Role.SUPERADMIN) {
+        return res.status(403).json({
+          success: false,
+          message:
+            "Forbidden: Only Admins or SuperAdmins can permanently delete showtimes.",
+        });
+      }
+
+      const deletedShowtimes = [];
+      const errors = [];
+
+      // Validate all IDs
+      const validIds = showtimeIds.filter((id) => {
+        if (mongoose.Types.ObjectId.isValid(id)) {
+          return true;
+        }
+        errors.push({ id, error: "Invalid ID format." });
+        return false;
+      });
+
+      // Find all showtimes (including soft-deleted ones)
+      const showtimes = await Showtime.collection
+        .find({
+          _id: { $in: validIds.map((id) => new mongoose.Types.ObjectId(id)) },
+        })
+        .toArray();
+
+      const showtimeMap = new Map(showtimes.map((s) => [s._id.toString(), s]));
+
+      // Process each showtime for permanent deletion
+      for (const id of validIds) {
+        const showtime = showtimeMap.get(id);
+
+        if (!showtime) {
+          errors.push({ id, error: "Showtime not found." });
+          continue;
+        }
+
+        // Check if showtime is completed - add extra warning for force delete
+        if (
+          showtime.status === "completed" &&
+          showtimeConfig.COMPLETED_SHOWTIME_PROTECTION.LOG_FORCE_DELETE_WARNINGS
+        ) {
+          // Allow force delete for completed showtimes but with strong warning
+          logger.warn(
+            `FORCE DELETE WARNING: Attempting to permanently delete completed showtime ${id}. This will remove historical data.`,
+            {
+              showtimeId: id,
+              status: showtime.status,
+              deletedBy: req.user.userId,
+              userRole: req.user.role,
+              configSetting:
+                "COMPLETED_SHOWTIME_PROTECTION.ALLOW_FORCE_DELETE = true",
+            },
+          );
+        }
+
+        // Check for any bookings
+        const bookingCount = await Booking.countDocuments({ showtimeId: id });
+        if (bookingCount > 0) {
+          errors.push({
+            id,
+            error: `Cannot permanently delete showtime. It has ${bookingCount} associated booking(s).`,
+          });
+          continue;
+        }
+
+        // Permanently delete the showtime
+        await Showtime.findByIdAndDelete(id);
+        deletedShowtimes.push(id);
+
+        logger.warn(
+          `PERMANENT DELETION: Showtime permanently deleted by ${req.user.role} ${req.user.userId}`,
+          {
+            deletedShowtime: {
+              id: showtime._id,
+              movie_id: showtime.movie_id,
+              hall_id: showtime.hall_id,
+              start_time: showtime.start_time,
+            },
+            deletedBy: req.user.userId,
+            deletedAt: new Date().toISOString(),
+          },
+        );
+      }
+
+      if (errors.length > 0) {
+        logger.warn("Bulk force delete showtime encountered errors:", {
+          errors,
+        });
+        return res.status(409).json({
+          success: false,
+          message: "Some showtimes could not be permanently deleted.",
+          data: {
+            deletedCount: deletedShowtimes.length,
+            failedCount: errors.length,
+            deletedShowtimeIds: deletedShowtimes,
+            errors,
+            warning: "These actions are irreversible.",
+          },
+        });
+      }
+
+      logger.info(
+        `Bulk permanently deleted ${deletedShowtimes.length} showtimes.`,
+      );
+
+      // Log Activity
+      if (deletedShowtimes.length > 0) {
+        const movieIds = [
+          ...new Set(
+            showtimes.map((s) => s.movie_id?.toString()).filter(Boolean),
+          ),
+        ];
+        const hallIds = [
+          ...new Set(
+            showtimes.map((s) => s.hall_id?.toString()).filter(Boolean),
+          ),
+        ];
+
+        const [movies, halls] = await Promise.all([
+          Movie.find({ _id: { $in: movieIds } }, "title").lean(),
+          Hall.find({ _id: { $in: hallIds } }, "hall_name").lean(),
+        ]);
+
+        await logActivity({
+          userId: req.user?.userId,
+          action: "SHOWTIME_FORCE_DELETE",
+          req,
+          metadata: {
+            bulk: true,
+            count: deletedShowtimes.length,
+            showtimeIds: deletedShowtimes,
+            movieTitles: movies.map((m) => m.title),
+            hallNames: halls.map((h) => h.hall_name),
+            dates: [...new Set(showtimes.map((s) => s.show_date))],
+          },
+        });
+      }
+
+      // Notify via Socket.io
+      emitEvent("showtime:deleted", {
+        count: deletedShowtimes.length,
+        ids: deletedShowtimes,
+      });
+
+      res.status(200).json({
+        success: true,
+        message: "All specified showtimes permanently deleted.",
+        data: {
+          deletedCount: deletedShowtimes.length,
+          deletedShowtimeIds: deletedShowtimes,
+          warning: "These actions are irreversible.",
+        },
+      });
+    } catch (error) {
+      logger.error("Bulk force delete showtime error:", error);
+      res.status(500).json({
+        success: false,
+        message: "An unexpected error occurred during bulk permanent deletion.",
+      });
+    }
+  }
+
+  //14. Duplicate multiple showtimes at once (edit & create new)
+  static async duplicateBulk(req, res, next) {
+    try {
+      const { showtimes } = req.body;
+
+      if (!Array.isArray(showtimes) || showtimes.length === 0) {
+        return res.status(400).json({ message: "No showtimes provided" });
+      }
+
+      const showtimesToDuplicate = showtimes.filter((s) => s._id);
+      const showtimesToCreate = showtimes.filter((s) => !s._id);
+
+      const duplicateIds = showtimesToDuplicate.map((s) => s._id);
+
+      let originalShowtimes = [];
+      if (duplicateIds.length > 0) {
+        originalShowtimes = await Showtime.find({ _id: { $in: duplicateIds } });
+      }
+
+      const originalShowtimesMap = new Map(
+        originalShowtimes.map((showtime) => [
+          showtime._id.toString(),
+          showtime.toObject(),
+        ]),
+      );
+
+      const duplicatedShowtimes = showtimesToDuplicate
+        .map((submittedShowtime) => {
+          const original = originalShowtimesMap.get(submittedShowtime._id);
+          if (!original) return null;
+
+          return {
+            ...original,
+            ...submittedShowtime,
+            _id: undefined,
+            __v: undefined,
+            createdAt: undefined,
+            updatedAt: undefined,
+          };
+        })
+        .filter(Boolean);
+
+      const showtimesToInsert = [...duplicatedShowtimes, ...showtimesToCreate];
+
+      if (showtimesToInsert.length === 0) {
+        return res
+          .status(400)
+          .json({ message: "No valid showtimes to create." });
+      }
+
+      const errors = [];
+      const createdBy = req.user?.userId;
+      const batchKeys = new Set(); // To track overlaps WITHIN this batch
+
+      // 1. Pre-validation Pass
+      for (let i = 0; i < showtimesToInsert.length; i++) {
+        const showtimeData = showtimesToInsert[i];
+        const { movie_id, hall_id, show_date, start_time } = showtimeData;
+
+        if (!movie_id || !hall_id || !show_date || !start_time) {
+          errors.push({
+            index: i,
+            error: `Row ${i + 1}: Missing required fields.`,
+          });
+          continue;
+        }
+
+        // Check internal batch duplicates
+        const normalizedDate = Showtime.safeNormalizeDate(show_date);
+        const isoDate = normalizedDate.toISOString().split("T")[0];
+        const batchKey = `${hall_id}_${isoDate}_${start_time}`;
+
+        if (batchKeys.has(batchKey)) {
+          errors.push({
+            index: i,
+            error: `Row ${i + 1}: Duplicate entry for the same hall/date/time found within this batch.`,
+          });
+          continue;
+        }
+        batchKeys.add(batchKey);
+
+        // Check if referenced documents exist
+        const [movie, hall] = await Promise.all([
+          Movie.findOne({ _id: movie_id, deletedAt: null }),
+          Hall.findOne({ _id: hall_id, deletedAt: null }),
+        ]);
+
+        if (!movie) {
+          errors.push({ index: i, error: `Row ${i + 1}: Movie not found.` });
+          continue;
+        }
+        if (!hall) {
+          errors.push({ index: i, error: `Row ${i + 1}: Hall not found.` });
+          continue;
+        }
+        if (movie.status === "ended") {
+          errors.push({
+            index: i,
+            error: `Row ${i + 1}: Movie "${movie.title}" has ended.`,
+          });
+          continue;
+        }
+
+        // Calculate end_time for overlap check
+        const tempShowtime = new Showtime(showtimeData);
+        if (!tempShowtime.end_time && movie.duration_minutes) {
+          const d = Showtime.safeNormalizeDate(tempShowtime.show_date);
+          const [h, m] = tempShowtime.start_time.split(":").map(Number);
+          const startDT = new Date(
+            Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), h, m),
+          );
+          const endDT = new Date(
+            startDT.getTime() + movie.duration_minutes * 60000,
+          );
+          // CRITICAL FIX: Use getUTCHours/Minutes
+          tempShowtime.end_time = `${String(endDT.getUTCHours()).padStart(2, "0")}:${String(endDT.getUTCMinutes()).padStart(2, "0")}`;
+        }
+
+        const overlapping = await Showtime.findOverlappingShowtimes(
+          hall_id,
+          show_date,
+          start_time,
+          tempShowtime.end_time,
+          null,
+        );
+
+        if (overlapping.length > 0) {
+          const match = overlapping[0];
+          errors.push({
+            index: i,
+            error: `Row ${i + 1}: Overlaps with an existing show (${match.start_time} - ${match.end_time}) in ${hall.hall_name}.`,
+          });
+        }
+      }
+
+      // 2. Abort if any errors found during pre-validation
+      if (errors.length > 0) {
+        return res.status(409).json({
+          success: false,
+          message: "Duplication aborted due to conflicts or validation errors.",
+          data: { errors },
+        });
+      }
+
+      // 3. Create all showtimes
+      const createdShowtimes = [];
+      try {
+        for (const showtimeData of showtimesToInsert) {
+          const showtime = new Showtime({ ...showtimeData, createdBy });
+          await showtime.save();
+          createdShowtimes.push(showtime);
+        }
+      } catch (saveError) {
+        logger.error("Error during showtime creation loop:", saveError);
+        // If we hit an error here, it might be a conflict that pre-validation missed
+        let message = "An unexpected error occurred during creation.";
+        if (saveError.name === "MongoError" && saveError.code === 11000) {
+          message =
+            "Duplicate showtime detected during batch creation. Some rows may conflict.";
+        } else if (saveError.message.includes("conflict")) {
+          message = saveError.message;
+        }
+
+        return res
+          .status(saveError.name === "ValidationError" ? 400 : 409)
+          .json({
+            success: false,
+            message: message,
+            details: saveError.message,
+            data: {
+              createdCount: createdShowtimes.length,
+              createdShowtimes,
+            },
+          });
+      }
+
+      logger.info(
+        `Bulk duplicated/created ${createdShowtimes.length} showtimes.`,
+      );
+      // Notify via Socket.io
+      emitEvent("showtime:created", {
+        count: createdShowtimes.length,
+        showtimes: createdShowtimes.map((s) => s.toObject()),
+      });
+
+      res.status(201).json({
+        success: true,
+        message: "All showtimes created/duplicated successfully.",
+        data: {
+          createdCount: createdShowtimes.length,
+          createdShowtimes,
+        },
+      });
+    } catch (err) {
+      console.error("Error in duplicateBulk:", err);
+      next(err);
+    }
+  }
+}
+
+module.exports = ShowtimeController;

@@ -1,0 +1,88 @@
+<script setup>
+import { RouterView } from "vue-router";
+import { computed, onMounted } from "vue";
+import { useAuthStore } from "@/stores/auth";
+import { useNotificationStore } from "@/stores/notification";
+import { usePermissionStore } from "@/stores/permission";
+import AppLoading from "@/components/common/AppLoading.vue";
+import { useI18n } from "vue-i18n";
+import { ElConfigProvider } from "element-plus";
+import en from "element-plus/dist/locale/en.mjs";
+import kh from "@/locales/element-plus/kh.js";
+
+import { watch } from "vue";
+import GlobalToast from "@/components/common/GlobalToast.vue";
+import CustomConfirmDialog from "@/components/common/CustomConfirmDialog.vue";
+
+const authStore = useAuthStore();
+const permissionStore = usePermissionStore();
+const notificationStore = useNotificationStore();
+const { locale } = useI18n();
+
+const elementPlusLocale = computed(() => {
+  return locale.value === "kh" ? kh : en;
+});
+
+// Show loading while auth is initializing
+const showLoading = computed(() => !authStore.isInitialized);
+
+// Watch for authentication changes to start/stop notification polling
+watch(
+  () => authStore.isAuthenticated,
+  (isAuth) => {
+    if (isAuth) {
+      notificationStore.fetchNotifications();
+    }
+  },
+  { immediate: true },
+);
+
+// Initialize auth and permissions on app start
+onMounted(async () => {
+  if (!authStore.isInitialized) {
+    await authStore.initializeAuth();
+
+    // Initialize permissions after auth is initialized
+    if (authStore.isAuthenticated) {
+      await permissionStore.initializePermissions();
+    }
+  }
+});
+</script>
+
+<template>
+  <el-config-provider :locale="elementPlusLocale">
+    <div id="app">
+      <!-- Show loading screen during auth initialization -->
+      <AppLoading v-if="showLoading" />
+
+      <!-- Show app content once auth is initialized -->
+      <RouterView v-else />
+
+      <!-- Global UI Components -->
+      <GlobalToast />
+      <CustomConfirmDialog />
+    </div>
+  </el-config-provider>
+</template>
+
+<style>
+/* Inter for English */
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap");
+/*Siemreap for Khmer */
+@import url("https://fonts.googleapis.com/css2?family=Siemreap&display=swap");
+
+#app {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+  font-family: "Inter", "Siemreap", sans-serif;
+}
+
+body {
+  background-color: #f5f7fa;
+}
+</style>

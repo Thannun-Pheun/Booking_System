@@ -1,0 +1,774 @@
+const mongoose = require("mongoose");
+
+const showtimeSchema = new mongoose.Schema(
+  {
+    hall_id: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Hall",
+      required: true,
+    },
+    movie_id: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Movie",
+    },
+    show_date: {
+      type: Date,
+      required: true,
+    },
+    start_time: {
+      type: String,
+      required: true,
+    },
+    end_time: {
+      type: String,
+    },
+    status: {
+      type: String,
+      enum: ["scheduled", "completed", "cancelled"],
+      default: "scheduled",
+    },
+    // Soft delete
+    deletedAt: { type: Date, default: null, index: true },
+    deletedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+    restoredAt: { type: Date, default: null },
+    restoredBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+    // Audit
+    createdBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+    updatedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+  },
+  {
+    timestamps: true,
+  },
+);
+
+// Indexes
+showtimeSchema.index({ movie_id: 1, start_time: 1, status: 1 });
+showtimeSchema.index(
+  { hall_id: 1, show_date: 1, start_time: 1 },
+  { unique: true, partialFilterExpression: { deletedAt: null } },
+);
+showtimeSchema.index({ hall_id: 1, start_time: 1 });
+showtimeSchema.index({ start_time: 1 });
+showtimeSchema.index({ status: 1 });
+showtimeSchema.index({ deletedAt: 1 });
+showtimeSchema.index({ createdAt: 1 });
+
+showtimeSchema.statics.safeNormalizeDate = function (dateInput) {
+  if (!dateInput) return null;
+  const d = new Date(dateInput);
+  if (isNaN(d.getTime())) return null;
+  // Use local date parts to resolve the "calendar day" intended by the user/system,
+  // then create a UTC date at midnight for that day.
+  return new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+};
+
+// Static methods
+showtimeSchema.statics.findOverlappingShowtimes = function (
+  hallId,
+  showDate,
+  startTime,
+  endTime,
+  showtimeId = null,
+) {
+  // Use safe normalization to ensure consistent day boundaries
+  const startOfDay = this.safeNormalizeDate(showDate);
+  const startOfNextDay = new Date(startOfDay.getTime() + 24 * 60 * 60 * 1000);
+
+  const query = {
+    hall_id: hallId,
+    show_date: { $gte: startOfDay, $lt: startOfNextDay }, // Range covers the full calendar day
+    start_time: { $lt: endTime },
+    end_time: { $gt: startTime },
+    deletedAt: null,
+  };
+
+  if (showtimeId) {
+    query._id = { $ne: showtimeId };
+  }
+  return this.find(query);
+};
+
+// Enhanced method to check if a showtime can be created at a specific time
+showtimeSchema.statics.canCreateShowtimeAt = async function (
+  hallId,
+  showDate,
+  startTime,
+  endTime,
+  showtimeId = null,
+  bufferMinutes = 0, // Add buffer time parameter
+) {
+  // Add buffer time to the time range for checking
+  let bufferedStartTime = startTime;
+  let bufferedEndTime = endTime;
+  
+  if (bufferMinutes > 0) {
+    // Convert times to minutes for calculation
+    const [startHour, startMin] = startTime.split(':').map(Number);
+    const [endHour, endMin] = endTime.split(':').map(Number);
+    
+    const startMinutes = startHour * 60 + startMin;
+    const endMinutes = endHour * 60 + endMin;
+    
+    // Apply buffer
+    const bufferedStart = Math.max(0, startMinutes - bufferMinutes);
+    const bufferedEnd = Math.min(24 * 60 - 1, endMinutes + bufferMinutes);
+    
+    // Convert back to HH:MM format
+    bufferedStartTime = `${String(Math.floor(bufferedStart / 60)).padStart(2, '0')}:${String(bufferedStart % 60).padStart(2, '0')}`;
+    bufferedEndTime = `${String(Math.floor(bufferedEnd / 60)).padStart(2, '0')}:${String(bufferedEnd % 60).padStart(2, '0')}`;
+  }
+  
+  const overlapping = await this.findOverlappingShowtimes(
+    hallId,
+    showDate,
+    bufferedStartTime,
+    bufferedEndTime,
+    showtimeId
+  );
+  
+  if (overlapping.length > 0) {
+    const conflict = overlapping[0];
+    let message = `Time conflict: Another showtime exists from ${conflict.start_time} to ${conflict.end_time}`;
+    
+    if (bufferMinutes > 0) {
+      message += ` (including ${bufferMinutes}-minute buffer time)`;
+    }
+    
+    return {
+      canCreate: false,
+      reason: 'TIME_CONFLICT',
+      message: message,
+      conflictingShowtime: {
+        id: conflict._id,
+        start_time: conflict.start_time,
+        end_time: conflict.end_time,
+        movie_id: conflict.movie_id
+      },
+      bufferApplied: bufferMinutes
+    };
+  }
+  
+  return {
+    canCreate: true,
+    message: 'Time slot is available'
+  };
+};
+
+// Method to validate if a showtime is in the past
+showtimeSchema.statics.validateNotInPast = function (showDate, startTime) {
+  const [hours, minutes] = startTime.split(':').map(Number);
+  
+  // Create showtime datetime in local timezone (Cambodia GMT+7)
+  const showtimeDate = new Date(showDate);
+  const localShowtimeDateTime = new Date(
+    showtimeDate.getFullYear(),
+    showtimeDate.getMonth(),
+    showtimeDate.getDate(),
+    hours,
+    minutes
+  );
+  
+  // Get current local time
+  const now = new Date();
+  
+  if (localShowtimeDateTime <= now) {
+    return {
+      isValid: false,
+      reason: 'PAST_TIME',
+      message: `Showtime cannot be scheduled in the past. Selected time: ${showDate} ${startTime} (local time), Current time: ${now.toString()}`
+    };
+  }
+  
+  return {
+    isValid: true,
+    message: 'Showtime is scheduled for the future'
+  };
+};
+
+showtimeSchema.statics.findAvailableByMovie = function (movieId, date) {
+  const startOfDay = this.safeNormalizeDate(date);
+
+  return this.find({
+    movie_id: movieId,
+    show_date: { $gte: startOfDay },
+    status: "scheduled",
+    deletedAt: null,
+  });
+};
+
+// Find showtimes by hall for a specific date
+showtimeSchema.statics.findByHallAndDate = function (hallId, date) {
+  const startOfDay = this.safeNormalizeDate(date);
+  const endOfDay = new Date(startOfDay.getTime() + 24 * 60 * 60 * 1000 - 1); // end of that same UTC day
+
+  return this.find({
+    hall_id: hallId,
+    show_date: { $gte: startOfDay, $lte: endOfDay },
+    deletedAt: null,
+  }).sort("start_time");
+};
+
+// Soft-deleted / active showtimes
+showtimeSchema.statics.findDeleted = function () {
+  return this.find({ deletedAt: { $ne: null } });
+};
+
+showtimeSchema.statics.findActive = function () {
+  return this.find({ deletedAt: null });
+};
+
+showtimeSchema.statics.getAnalytics = async function (query = {}) {
+  const analytics = await this.aggregate([
+    {
+      $match: {
+        ...query,
+        deletedAt: null,
+      },
+    },
+    {
+      $facet: {
+        generalStats: [
+          {
+            $group: {
+              _id: null,
+              totalShowtimes: { $sum: 1 },
+              scheduled: {
+                $sum: { $cond: [{ $eq: ["$status", "scheduled"] }, 1, 0] },
+              },
+              completed: {
+                $sum: { $cond: [{ $eq: ["$status", "completed"] }, 1, 0] },
+              },
+              cancelled: {
+                $sum: { $cond: [{ $eq: ["$status", "cancelled"] }, 1, 0] },
+              },
+            },
+          },
+          {
+            $project: {
+              _id: 0,
+              totalShowtimes: 1,
+              statusCounts: {
+                scheduled: "$scheduled",
+                completed: "$completed",
+                cancelled: "$cancelled",
+              },
+            },
+          },
+        ],
+        byMovie: [
+          { $group: { _id: "$movie_id", count: { $sum: 1 } } },
+          {
+            $lookup: {
+              from: "movies",
+              localField: "_id",
+              foreignField: "_id",
+              as: "movie",
+            },
+          },
+          { $unwind: { path: "$movie", preserveNullAndEmptyArrays: true } },
+          {
+            $project: {
+              _id: 0,
+              movie: { $ifNull: ["$movie.title", "Unknown"] },
+              count: 1,
+            },
+          },
+          { $sort: { count: -1 } },
+        ],
+        byTheater: [
+          {
+            $lookup: {
+              from: "halls",
+              localField: "hall_id",
+              foreignField: "_id",
+              as: "hall",
+            },
+          },
+          { $unwind: { path: "$hall", preserveNullAndEmptyArrays: true } },
+          { $group: { _id: "$hall.theater_id", count: { $sum: 1 } } },
+          {
+            $lookup: {
+              from: "theaters",
+              localField: "_id",
+              foreignField: "_id",
+              as: "theater",
+            },
+          },
+          { $unwind: { path: "$theater", preserveNullAndEmptyArrays: true } },
+          {
+            $project: {
+              _id: 0,
+              theater: { $ifNull: ["$theater.name", "Unknown"] },
+              count: 1,
+            },
+          },
+          { $sort: { count: -1 } },
+        ],
+      },
+    },
+    {
+      $project: {
+        stats: { $arrayElemAt: ["$generalStats", 0] },
+        byMovie: "$byMovie",
+        byTheater: "$byTheater",
+      },
+    },
+    {
+      $replaceRoot: {
+        newRoot: {
+          $mergeObjects: [
+            { $ifNull: ["$stats", {}] },
+            { showtimesByMovie: "$byMovie" },
+            { showtimesByTheater: "$byTheater" },
+          ],
+        },
+      },
+    },
+  ]);
+
+  return (
+    analytics[0] || {
+      totalShowtimes: 0,
+      statusCounts: { scheduled: 0, completed: 0, cancelled: 0 },
+      showtimesByMovie: [],
+      showtimesByTheater: [],
+    }
+  );
+};
+
+// Enhanced method to validate showtime integrity and find overlaps
+showtimeSchema.statics.validateIntegrity = async function () {
+  const issues = [];
+  
+  try {
+    // 1. Find showtimes without end_time
+    const noEndTime = await this.find({ 
+      deletedAt: null, 
+      $or: [{ end_time: null }, { end_time: { $exists: false } }] 
+    });
+    
+    if (noEndTime.length > 0) {
+      issues.push({
+        type: 'missing_end_time',
+        count: noEndTime.length,
+        message: `${noEndTime.length} showtimes missing end_time`,
+        showtimes: noEndTime.map(st => ({ id: st._id, start_time: st.start_time }))
+      });
+    }
+    
+    // 2. Find showtimes with invalid times (start >= end)
+    const allShowtimes = await this.find({ deletedAt: null });
+    const invalidTimes = allShowtimes.filter(st => {
+      if (st.start_time && st.end_time) {
+        return st.start_time >= st.end_time;
+      }
+      return false;
+    });
+    
+    if (invalidTimes.length > 0) {
+      issues.push({
+        type: 'invalid_times',
+        count: invalidTimes.length,
+        message: `${invalidTimes.length} showtimes with start_time >= end_time`,
+        showtimes: invalidTimes.map(st => ({ 
+          id: st._id, 
+          start_time: st.start_time, 
+          end_time: st.end_time 
+        }))
+      });
+    }
+    
+    // 3. Find overlapping showtimes
+    const overlaps = await this.findAllOverlaps();
+    if (overlaps.length > 0) {
+      issues.push({
+        type: 'overlaps',
+        count: overlaps.length,
+        message: `${overlaps.length} overlapping showtime pairs`,
+        overlaps: overlaps
+      });
+    }
+    
+    return {
+      isValid: issues.length === 0,
+      issues: issues,
+      summary: issues.length === 0 ? 'All showtimes are valid' : `Found ${issues.length} types of issues`
+    };
+    
+  } catch (error) {
+    return {
+      isValid: false,
+      error: error.message,
+      summary: 'Validation failed due to error'
+    };
+  }
+};
+
+// Method to find all overlapping showtimes
+showtimeSchema.statics.findAllOverlaps = async function () {
+  const showtimes = await this.find({ deletedAt: null })
+    .populate('hall_id', 'hall_name')
+    .populate('movie_id', 'title')
+    .sort({ hall_id: 1, show_date: 1, start_time: 1 });
+
+  const groupedShowtimes = {};
+  
+  showtimes.forEach(showtime => {
+    const hallId = showtime.hall_id._id.toString();
+    const date = showtime.show_date.toISOString().split('T')[0];
+    const key = `${hallId}_${date}`;
+    
+    if (!groupedShowtimes[key]) {
+      groupedShowtimes[key] = {
+        hall: showtime.hall_id.hall_name,
+        date: date,
+        showtimes: []
+      };
+    }
+    
+    groupedShowtimes[key].showtimes.push({
+      id: showtime._id,
+      movie: showtime.movie_id?.title || 'Unknown',
+      start_time: showtime.start_time,
+      end_time: showtime.end_time,
+      status: showtime.status,
+      createdAt: showtime.createdAt
+    });
+  });
+
+  const allOverlaps = [];
+  
+  for (const [key, group] of Object.entries(groupedShowtimes)) {
+    for (let i = 0; i < group.showtimes.length; i++) {
+      for (let j = i + 1; j < group.showtimes.length; j++) {
+        const showtime1 = group.showtimes[i];
+        const showtime2 = group.showtimes[j];
+        
+        if (showtime1.start_time < showtime2.end_time && showtime1.end_time > showtime2.start_time) {
+          allOverlaps.push({
+            hall: group.hall,
+            date: group.date,
+            showtime1: showtime1,
+            showtime2: showtime2
+          });
+        }
+      }
+    }
+  }
+
+  return allOverlaps;
+};
+
+// Instance methods
+showtimeSchema.methods.softDelete = function (deletedBy = null) {
+  this.deletedAt = new Date();
+  this.deletedBy = deletedBy;
+  return this.save();
+};
+
+showtimeSchema.methods.restore = function (userId) {
+  this.restoredAt = new Date();
+  this.restoredBy = userId;
+  this.deletedAt = null;
+  this.deletedBy = null;
+  return this.save();
+};
+
+showtimeSchema.methods.isDeleted = function () {
+  return this.deletedAt !== null;
+};
+
+showtimeSchema.methods.isUpcoming = function () {
+  const [hours, minutes] = this.start_time.split(":");
+  
+  // Create showtime datetime in local timezone
+  const showtimeDate = new Date(this.show_date);
+  const localShowDateTime = new Date(
+    showtimeDate.getFullYear(),
+    showtimeDate.getMonth(),
+    showtimeDate.getDate(),
+    parseInt(hours),
+    parseInt(minutes)
+  );
+  
+  return localShowDateTime > new Date();
+};
+
+showtimeSchema.methods.isPast = function () {
+  const [hours, minutes] = this.end_time.split(":");
+  
+  // Create showtime end datetime in local timezone
+  const showtimeDate = new Date(this.show_date);
+  const localShowEndDateTime = new Date(
+    showtimeDate.getFullYear(),
+    showtimeDate.getMonth(),
+    showtimeDate.getDate(),
+    parseInt(hours),
+    parseInt(minutes)
+  );
+  
+  return localShowEndDateTime < new Date();
+};
+
+showtimeSchema.methods.updateStatus = function (newStatus, updateBy = null) {
+  const validStatuses = ["scheduled", "completed", "cancelled"];
+  if (!validStatuses.includes(newStatus)) {
+    throw new Error("Invalid status provided");
+  }
+  this.status = newStatus;
+  this.updatedBy = updateBy;
+  return this.save();
+};
+
+showtimeSchema.methods.isActiveForBooking = function () {
+  return this.status === "scheduled" && this.isUpcoming();
+};
+
+// Middleware
+// Exclude soft-deleted documents
+showtimeSchema.pre(/^find/, function (next) {
+  if (this.getFilter().deletedAt === undefined) {
+    this.where({ deletedAt: null });
+  }
+  next();
+});
+
+// Pre-save: auto-calculate end time, validate overlapping, auto-update status
+showtimeSchema.pre("save", async function (next) {
+  // Normalize show_date to UTC start of day
+  if (this.show_date) {
+    this.show_date = this.constructor.safeNormalizeDate(this.show_date);
+  }
+
+  // Validate that showtime is not in the past (for new showtimes or when date/time is modified)
+  if (
+    (this.isNew || this.isModified("show_date") || this.isModified("start_time")) &&
+    this.show_date && this.start_time
+  ) {
+    const pastValidation = this.constructor.validateNotInPast(this.show_date, this.start_time);
+    if (!pastValidation.isValid) {
+      return next(new Error(pastValidation.message));
+    }
+  }
+
+  // Auto-calculate end_time from movie duration if not provided or if dependencies change
+  if (
+    this.isNew ||
+    this.isModified("start_time") ||
+    this.isModified("movie_id")
+  ) {
+    if (this.movie_id && this.start_time) {
+      try {
+        const Movie = mongoose.model("Movie");
+        const movie = await Movie.findById(this.movie_id);
+        if (movie && movie.duration_minutes) {
+          const d = new Date(this.show_date);
+          const [startHours, startMinutes] = this.start_time
+            .split(":")
+            .map(Number);
+          // startDateTime is the literal point in time represented by the UTC date and local time parts
+          const startDateTime = new Date(
+            Date.UTC(
+              d.getUTCFullYear(),
+              d.getUTCMonth(),
+              d.getUTCDate(),
+              startHours,
+              startMinutes,
+            ),
+          );
+          const totalDuration = movie.duration_minutes;
+          const endDateTime = new Date(
+            startDateTime.getTime() + totalDuration * 60000,
+          );
+          this.end_time = `${String(endDateTime.getUTCHours()).padStart(
+            2,
+            "0",
+          )}:${String(endDateTime.getUTCMinutes()).padStart(2, "0")}`;
+        }
+      } catch (error) {
+        return next(
+          new Error(`Failed to calculate end time: ${error.message}`),
+        );
+      }
+    }
+  }
+
+  if (!this.end_time) {
+    return next(
+      new Error(
+        "Showtime end_time is required but was not provided and could not be calculated.",
+      ),
+    );
+  }
+
+  // Enhanced overlap validation with better error messages
+  if (
+    this.isNew ||
+    this.isModified("start_time") ||
+    this.isModified("end_time") ||
+    this.isModified("show_date") ||
+    this.isModified("hall_id")
+  ) {
+    // Use the enhanced validation method
+    const validation = await this.constructor.canCreateShowtimeAt(
+      this.hall_id,
+      this.show_date,
+      this.start_time,
+      this.end_time,
+      this._id,
+    );
+    
+    if (!validation.canCreate) {
+      // Get hall information for better error message
+      try {
+        const Hall = mongoose.model("Hall");
+        const hall = await Hall.findById(this.hall_id);
+        const hallName = hall ? hall.hall_name : 'Unknown Hall';
+        
+        return next(
+          new Error(
+            `Showtime conflict in ${hallName}: Cannot schedule from ${this.start_time} to ${this.end_time} because it overlaps with an existing showtime (${validation.conflictingShowtime.start_time} - ${validation.conflictingShowtime.end_time}). Please choose a different time slot.`,
+          ),
+        );
+      } catch (error) {
+        return next(new Error(validation.message));
+      }
+    }
+  }
+
+  // Auto-update status if end_time has passed
+  if (this.status === "scheduled") {
+    const [hours, minutes] = this.end_time.split(":");
+    
+    // Create showtime end datetime in local timezone
+    const showtimeDate = new Date(this.show_date);
+    const localShowEndDateTime = new Date(
+      showtimeDate.getFullYear(),
+      showtimeDate.getMonth(),
+      showtimeDate.getDate(),
+      parseInt(hours),
+      parseInt(minutes)
+    );
+    
+    if (localShowEndDateTime < new Date()) {
+      this.status = "completed";
+    }
+  }
+
+  // If status has been changed to 'completed' (either manually or automatically),
+  // we clean up the seat booking records for this showtime.
+  if (this.isModified("status") && this.status === "completed") {
+    const SeatBooking = mongoose.model("SeatBooking");
+    const logger = require("../utils/logger");
+
+    try {
+      logger.info(
+        `Showtime ${this._id} completed. Deleting associated seat bookings.`,
+      );
+      const { deletedCount } = await SeatBooking.deleteMany({
+        showtimeId: this._id,
+      });
+      logger.info(
+        `Deleted ${deletedCount} seat bookings for completed showtime ${this._id}.`,
+      );
+    } catch (error) {
+      logger.error(
+        `Error deleting seat bookings for showtime ${this._id}: ${error.message}`,
+      );
+    }
+  }
+
+  // If status has been changed to 'cancelled', cancel all associated bookings.
+  // The updated booking.cancelBooking() method will handle deleting SeatBooking entries.
+  if (this.isModified("status") && this.status === "cancelled") {
+    const Booking = mongoose.model("Booking");
+    const logger = require("../utils/logger");
+
+    try {
+      logger.info(
+        `Showtime ${this._id} cancelled. Cancelling associated bookings.`,
+      );
+      const bookingsToCancel = await Booking.find({
+        showtimeId: this._id,
+        booking_status: { $ne: "Expired" },
+      });
+
+      if (bookingsToCancel.length > 0) {
+        const cancellationPromises = bookingsToCancel.map((booking) =>
+          booking.expireBooking(`Showtime was cancelled.`),
+        );
+        await Promise.all(cancellationPromises);
+        logger.info(
+          `Cancelled ${bookingsToCancel.length} bookings for showtime ${this._id}.`,
+        );
+      } else {
+        logger.info(`No active bookings to cancel for showtime ${this._id}.`);
+      }
+    } catch (error) {
+      logger.error(
+        `Error cancelling bookings for showtime ${this._id}: ${error.message}`,
+      );
+    }
+  }
+
+  next();
+});
+// Auto-update status on find operations
+showtimeSchema.post(/^find/, async function (result, next) {
+  try {
+    if (!result) {
+      return next();
+    }
+
+    const docs = Array.isArray(result) ? result : [result];
+    const now = new Date();
+    const updates = [];
+
+    for (const doc of docs) {
+      if (doc && doc.status === "scheduled" && doc.end_time && doc.show_date) {
+        const [hours, minutes] = doc.end_time.split(":");
+        
+        // Create showtime end datetime in local timezone
+        const showtimeDate = new Date(doc.show_date);
+        const localShowEndDateTime = new Date(
+          showtimeDate.getFullYear(),
+          showtimeDate.getMonth(),
+          showtimeDate.getDate(),
+          parseInt(hours),
+          parseInt(minutes)
+        );
+
+        if (localShowEndDateTime < now) {
+          doc.status = "completed";
+          updates.push(doc.save()); // This will trigger a save and its own middleware
+        }
+      }
+    }
+
+    if (updates.length > 0) {
+      await Promise.all(updates);
+    }
+  } catch (error) {
+    console.error("Error in post-find hook for showtime status update:", error);
+    // We call next() anyway to not break the query for the client
+  }
+  next();
+});
+
+module.exports = mongoose.model("Showtime", showtimeSchema);

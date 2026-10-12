@@ -1,0 +1,26 @@
+const backupController = require('./backup.controller');
+
+// Export all controllers
+module.exports = {
+    UserController: require('./user.controller'),
+    AuthController: require('./auth.controller'),
+    SeatController: require('./seat.controller'),
+    SeatBookingController: require('./seatBooking.controller'),
+    HallController: require('./hall.controller'),
+    TheaterController: require('./theater.controller'),
+    BookingController: require('./booking.controller'),
+    CustomerController: require('./customer.controller'),
+    BookingTicketController: require('./bookingTicket.controller'),
+
+    BookingDetailController: require('./bookingDetail.controller'),
+    PaymentController: require('./payment.controller'),
+    InvoiceController: require('./invoice.controller'),
+    MovieController: require('./movie.controller'),
+    ShowtimeController: require('./showtime.controller'),
+    UploadController: require('./upload.controller'),
+    PromotionController: require('./promotion.controller'),
+    SeatBookingController: require('./seatBooking.controller'),
+    backupController: require('./backup.controller'),
+    PermissionController: require("./permission.controller"),
+
+};

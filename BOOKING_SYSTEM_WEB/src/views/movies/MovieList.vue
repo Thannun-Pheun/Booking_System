@@ -1,0 +1,425 @@
+<template>
+  <div class="movie-list">
+    <div class="page-header">
+      <h2>{{ $t("movies.title") }}</h2>
+      <el-button
+        v-permission="'movies.create'"
+        type="primary"
+        @click="$router.push({ name: 'CreateMovie' })"
+      >
+        <el-icon>
+          <Plus />
+        </el-icon>
+        {{ $t("movies.addMovie") }}
+      </el-button>
+    </div>
+
+    <el-card class="filter-card" shadow="never">
+      <div class="toolbar">
+        <el-input
+          v-model="searchText"
+          :placeholder="$t('movies.searchMovies')"
+          class="search-input"
+          :prefix-icon="Search"
+          clearable
+          style="width: 200px"
+          @input="debouncedSearch"
+        />
+        <el-select
+          v-model="statusFilter"
+          :placeholder="$t('movies.filterByStatus')"
+          clearable
+          @change="load"
+          class="filter-select"
+        >
+          <el-option :label="$t('table.selectAll')" value="" />
+          <el-option
+            v-for="opt in movieService.MOVIE_STATUSES"
+            :key="opt.value"
+            :label="opt.label"
+            :value="opt.value"
+          />
+        </el-select>
+        <el-select
+          v-model="genreFilter"
+          :placeholder="$t('movies.filterByGenre')"
+          clearable
+          @change="load"
+          class="filter-select"
+        >
+          <el-option :label="$t('table.selectAll')" value="" />
+          <el-option
+            v-for="opt in movieService.MOVIE_GENRES"
+            :key="opt.value"
+            :label="opt.label"
+            :value="opt.value"
+          />
+        </el-select>
+        <el-select
+          v-model="sortBy"
+          :placeholder="$t('movies.sortBy')"
+          @change="load"
+          class="filter-select"
+        >
+          <el-option
+            v-for="opt in movieService.SORT_OPTIONS"
+            :key="opt.value"
+            :label="opt.label"
+            :value="opt.value"
+          />
+        </el-select>
+      </div>
+    </el-card>
+
+    <el-card shadow="never">
+      <el-table
+        :data="rows"
+        v-loading="loading"
+        style="width: 100%"
+        ref="movieTable"
+        @selection-change="handleSelectionChange"
+      >
+        <el-table-column type="selection" width="55" />
+        <el-table-column
+          prop="title"
+          :label="$t('movies.movieTitle')"
+          min-width="250"
+        >
+          <template #default="{ row }">
+            <div class="movie-title-cell">
+              <img
+                v-if="row.poster_url"
+                :src="row.poster_url"
+                class="movie-poster-thumb"
+              />
+              <span>{{ row.title }}</span>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column
+          prop="director"
+          :label="$t('movies.director')"
+          width="140"
+        />
+        <el-table-column prop="genres" :label="$t('movies.genres')" width="180">
+          <template #default="{ row }">
+            <el-tag
+              v-for="genre in row.genres"
+              :key="genre"
+              size="small"
+              style="margin: 2px"
+            >
+              {{ $t(`movies.genreTypes.${genre}`) }}
+            </el-tag>
+            <span v-if="!row.genres || row.genres.length === 0">-</span>
+          </template>
+        </el-table-column>
+        <el-table-column
+          prop="duration_display"
+          :label="$t('movies.duration')"
+          width="100"
+        />
+        <el-table-column
+          prop="release_date"
+          :label="$t('movies.releaseDate')"
+          width="160"
+        >
+        </el-table-column>
+        <el-table-column
+          prop="end_date"
+          :label="$t('movies.endDate')"
+          width="140"
+        >
+        </el-table-column>
+        <el-table-column prop="rating" :label="$t('movies.rating')" width="150">
+          <template #default="{ row }">
+            <el-rate
+              v-model="row.rating"
+              disabled
+              :max="10"
+              style="height: 20px"
+            />
+          </template>
+        </el-table-column>
+        <el-table-column prop="status" :label="$t('movies.status')" width="150">
+          <template #default="{ row }">
+            <el-tag :type="getStatusTagType(row.status)" size="small">
+              {{ $t(`movies.statuses.${row.status}`) }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column
+          :label="$t('common.actions')"
+          width="220"
+          fixed="right"
+        >
+          <template #default="{ row }">
+            <el-button
+              v-permission="'movies.view'"
+              size="small"
+              link
+              type="primary"
+              @click="viewMovie(row.id)"
+            >
+              {{ $t("actions.view") }}
+            </el-button>
+            <el-button
+              v-permission="'movies.edit'"
+              size="small"
+              link
+              type="primary"
+              @click="editMovie(row.id)"
+            >
+              {{ $t("actions.edit") }}
+            </el-button>
+            <el-button
+              v-permission="'movies.delete'"
+              size="small"
+              link
+              type="danger"
+              @click="deleteMovie(row.id)"
+            >
+              {{ $t("actions.delete") }}
+            </el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+
+      <!-- Bulk Actions -->
+      <div class="bulk-actions" v-if="selectedMovies.length > 0">
+        <el-button
+          type="danger"
+          @click="bulkDeleteMovies"
+          v-permission="'movies.delete'"
+        >
+          {{ $t("actions.deleteSelected") }} ({{ selectedMovies.length }})
+        </el-button>
+        <el-button type="default" @click="cancelSelection">
+          {{ $t("actions.cancel") }}
+        </el-button>
+      </div>
+
+      <div class="pagination">
+        <el-pagination
+          v-model:current-page="currentPage"
+          v-model:page-size="pageSize"
+          :page-sizes="[10, 20, 50, 100]"
+          :total="total"
+          layout="total, sizes, prev, pager, next, jumper"
+          @size-change="handleSizeChange"
+          @current-change="handleCurrentChange"
+        />
+      </div>
+    </el-card>
+  </div>
+</template>
+
+<script setup>
+import { onMounted, ref } from "vue";
+import { useRouter } from "vue-router";
+import { useI18n } from "vue-i18n";
+import { useAppStore } from "@/stores/app";
+import { movieService } from "@/services/movieService";
+import { ElMessage, ElMessageBox } from "element-plus";
+import { Plus, Search } from "@element-plus/icons-vue";
+import { debounce } from "lodash-es";
+import { formatDate } from "@/utils/formatters";
+
+const router = useRouter();
+const appStore = useAppStore();
+const { t } = useI18n();
+
+const loading = ref(false);
+const rows = ref([]);
+const total = ref(0);
+const currentPage = ref(1);
+const pageSize = ref(10);
+const searchText = ref("");
+const statusFilter = ref("");
+const genreFilter = ref("");
+const sortBy = ref("release_date");
+const movieTable = ref(null);
+const selectedMovies = ref([]);
+
+const handleSelectionChange = (val) => {
+  selectedMovies.value = val;
+};
+
+const cancelSelection = () => {
+  selectedMovies.value = [];
+  if (movieTable.value) {
+    movieTable.value.clearSelection();
+  }
+};
+
+const bulkDeleteMovies = async () => {
+  try {
+    await ElMessageBox.confirm(
+      t("movies.confirmDeleteMultiple", { count: selectedMovies.value.length }),
+      t("actions.delete"),
+      {
+        confirmButtonText: t("actions.delete"),
+        cancelButtonText: t("actions.cancel"),
+        type: "warning",
+      },
+    );
+
+    const ids = selectedMovies.value.map((movie) => movie.id);
+    // Assuming movieService.bulkDeleteMovies(ids) exists or will be created.
+    await movieService.bulkDeleteMovies(ids);
+
+    ElMessage.success(
+      t("movies.deleteMultipleSuccess", { count: selectedMovies.value.length }),
+    );
+    cancelSelection();
+    load(); // Reload the list
+  } catch (error) {
+    if (error !== "cancel") {
+      console.error("Failed to bulk delete movies:", error);
+      ElMessage.error(t("movies.deleteMultipleError"));
+    }
+  }
+};
+
+const debouncedSearch = debounce(() => {
+  currentPage.value = 1;
+  load();
+}, 500);
+
+const load = async () => {
+  loading.value = true;
+  try {
+    const params = {
+      page: currentPage.value,
+      per_page: pageSize.value,
+      search: searchText.value || undefined,
+      status: statusFilter.value || undefined,
+      genre: genreFilter.value || undefined,
+      sort_by: sortBy.value || "release_date",
+      sort_order: "desc",
+    };
+    const res = await movieService.getMovies(params);
+    rows.value = res.data;
+    total.value = res.total || 0;
+  } catch (e) {
+    console.error(e);
+    ElMessage.error(t("movies.loadError"));
+  } finally {
+    loading.value = false;
+  }
+};
+
+const handleSizeChange = (size) => {
+  pageSize.value = size;
+  currentPage.value = 1;
+  load();
+};
+
+const handleCurrentChange = (page) => {
+  currentPage.value = page;
+  load();
+};
+
+const viewMovie = (id) => router.push({ name: "MovieDetail", params: { id } });
+const editMovie = (id) => router.push({ name: "EditMovie", params: { id } });
+
+const deleteMovie = async (id) => {
+  try {
+    await ElMessageBox.confirm(
+      t("movies.confirmDelete"),
+      t("movies.deleteMovie"),
+      { type: "warning" },
+    );
+    await movieService.deleteMovie(id);
+    ElMessage.success(t("movies.deleteSuccess"));
+    if (rows.value.length === 1 && currentPage.value > 1) {
+      currentPage.value--;
+    }
+    load();
+  } catch (err) {
+    if (err !== "cancel") {
+      console.error(err);
+      ElMessage.error(t("movies.deleteError"));
+    }
+  }
+};
+
+const getStatusTagType = (status) => {
+  switch (status) {
+    case "now_showing":
+      return "success";
+    case "coming_soon":
+      return "warning";
+    case "ended":
+      return "info";
+    default:
+      return "";
+  }
+};
+
+onMounted(() => {
+  appStore.setBreadcrumbs([
+    { title: t("nav.dashboard"), path: "/" },
+    { title: t("movies.title"), path: "/movies" },
+    { title: t("movies.allMovies") },
+  ]);
+  load();
+});
+</script>
+
+<style scoped>
+.filter-card {
+  margin-bottom: 10px;
+}
+
+.page-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 24px;
+}
+
+.toolbar {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+
+.search-input {
+  width: 280px;
+}
+
+.filter-select {
+  width: 180px;
+}
+
+.movie-title-cell {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.movie-poster-thumb {
+  width: 40px;
+  height: 60px;
+  object-fit: cover;
+  border-radius: 4px;
+}
+
+.bulk-actions {
+  margin: 16px 0;
+  padding: 12px;
+  border-radius: 4px;
+  background-color: var(--el-fill-color-lighter);
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.pagination {
+  margin-top: 16px;
+  display: flex;
+  justify-content: center;
+}
+</style>

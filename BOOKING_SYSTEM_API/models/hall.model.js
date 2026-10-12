@@ -1,0 +1,541 @@
+const { required } = require("joi");
+const mongoose = require("mongoose");
+const logger = require("../utils/logger");
+
+const hallSchema = new mongoose.Schema(
+  {
+    hall_name: {
+      type: String,
+      required: true,
+      trim: true,
+      minlength: 1,
+      maxlength: 100,
+      index: true,
+      validate: {
+        validator: function(value) {
+          // Check for proper format - no leading/trailing spaces
+          if (value !== value.trim()) return false;
+          
+          // Must start with alphanumeric characters
+          if (!/^[a-zA-Z0-9]/.test(value)) {
+            return false;
+          }
+          
+          // Must end with alphanumeric or allowed punctuation: ! ? ) "
+          if (!/[a-zA-Z0-9\!\?\)\"]$/.test(value)) {
+            return false;
+          }
+          
+          // Only allow letters, numbers, spaces, and basic punctuation
+          return /^[a-zA-Z0-9\s\-\.\,\:\!\?\'\"\(\)]+$/.test(value);
+        },
+        message: 'Hall name must start with a letter or number, end with a letter, number, or allowed punctuation (! ? ) "), and can only contain letters, numbers, spaces, and basic punctuation (- . , : ! ? \' " ( ))'
+      }
+    },
+    total_seats: {
+      type: Number,
+      required: false,
+      min: 0,
+      max: 1000,
+      default: 0,
+    },
+    theater_id: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Theater",
+      required: true,
+    },
+    screen_type: {
+      type: String,
+      enum: ["2d", "standard", "imax", "3d", "4dx", "vip"],
+      default: "standard",
+    },
+    // capacity: {
+    //   type: Object,
+    //   default: {
+    //     standard: 0,
+    //     premium: 0,
+    //     vip: 0,
+    //     wheelchair: 0,
+    //     recliner: 0,
+    //   },
+    // },
+    // dimensions: {
+    //   width: {
+    //     type: Number,
+    //     min: 1,
+    //     max: 100,
+    //     default: 10,
+    //   },
+    //   height: {
+    //     type: Number,
+    //     min: 1,
+    //     max: 100,
+    //     default: 10,
+    //   },
+    // },
+    status: {
+      type: String,
+      enum: ["active", "maintenance", "closed", "renovation"],
+      default: "active",
+      index: true,
+    },
+    features: {
+      type: [String],
+      enum: [
+        "dolby_atmos",
+        "surround_sound",
+        "premium_seating",
+        "wheelchair_accessible",
+        "air_conditioning",
+        "heating",
+      ],
+      default: [],
+    },
+    notes: {
+      type: String,
+      trim: true,
+      maxlength: 1000,
+      default: "",
+    },
+    // Soft delete fields
+    deletedAt: {
+      type: Date,
+      default: null,
+      index: true,
+    },
+    deletedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+    restoredAt: {
+      type: Date,
+      default: null,
+    },
+    restoredBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+    // Audit fields
+    createdBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+    updatedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+  },
+  {
+    timestamps: true,
+  },
+);
+
+// Indexes for faster queries
+hallSchema.index({ hall_name: 1, theater_id: 1 }, { unique: true });
+hallSchema.index({ screen_type: 1 });
+hallSchema.index({ status: 1 });
+hallSchema.index({ total_seats: 1 });
+hallSchema.index({ deletedAt: 1 });
+hallSchema.index({ createdAt: 1 });
+hallSchema.index({ "capacity.standard": 1 });
+hallSchema.index({ "capacity.premium": 1 });
+hallSchema.index({ "capacity.vip": 1 });
+
+// Pre-save middleware to check for duplicate names (case-insensitive) in the same theater
+hallSchema.pre('save', async function(next) {
+  if (this.isModified('hall_name') || this.isModified('theater_id')) {
+    const nameRegex = new RegExp(`^${this.hall_name.trim()}$`, 'i');
+    
+    const query = {
+      hall_name: nameRegex,
+      _id: { $ne: this._id },
+      deletedAt: null
+    };
+    
+    // Only check theater_id if it exists (some halls might not have theater_id)
+    if (this.theater_id) {
+      query.theater_id = this.theater_id;
+    }
+    
+    const existingHall = await this.constructor.findOne(query);
+    
+    if (existingHall) {
+      const error = new Error('A hall with this name already exists in this theater');
+      error.code = 11000; // Duplicate key error code
+      return next(error);
+    }
+  }
+  next();
+});
+
+// Pre-validate middleware to ensure hall_name format
+hallSchema.pre('validate', function(next) {
+  if (this.hall_name) {
+    // Check for leading/trailing spaces (before trim)
+    if (this.hall_name !== this.hall_name.trim()) {
+      return next(new Error('Hall name cannot have leading or trailing spaces'));
+    }
+    
+    // Trim the name
+    this.hall_name = this.hall_name.trim();
+    
+    // Validate start format
+    if (!/^[a-zA-Z0-9]/.test(this.hall_name)) {
+      return next(new Error('Hall name must start with a letter or number'));
+    }
+    
+    // Validate end format - allow ! ? ) "
+    if (!/[a-zA-Z0-9\!\?\)\"]$/.test(this.hall_name)) {
+      return next(new Error('Hall name must end with a letter, number, or allowed punctuation (! ? ) ")'));
+    }
+    
+    // Validate allowed characters
+    if (!/^[a-zA-Z0-9\s\-\.\,\:\!\?\'\"\(\)]+$/.test(this.hall_name)) {
+      return next(new Error('Hall name can only contain letters, numbers, spaces, and basic punctuation (- . , : ! ? \' " ( ))'));
+    }
+  }
+  next();
+});
+
+// Instance method for soft delete
+hallSchema.methods.softDelete = function (deletedBy = null) {
+  this.deletedAt = new Date();
+  this.deletedBy = deletedBy;
+  this.status = "closed"; // Change status when deleted
+  return this.save();
+};
+
+// Instance method for restore
+hallSchema.methods.restore = function (restoredBy = null) {
+  this.deletedAt = null;
+  this.deletedBy = null;
+  this.restoredAt = new Date();
+  this.restoredBy = restoredBy;
+  this.status = "active"; // Restore to active status
+  return this.save();
+};
+
+// Instance method to check if deleted
+hallSchema.methods.isDeleted = function () {
+  return this.deletedAt !== null;
+};
+
+// Instance method to check for associated active seats
+hallSchema.methods.hasActiveSeats = async function () {
+  const Seat = mongoose.model("Seat");
+  const associatedSeats = await Seat.find({
+    hall_id: this._id,
+    deletedAt: null, // Only count active seats
+  });
+
+  if (associatedSeats.length > 0) {
+    return {
+      hasSeats: true,
+      count: associatedSeats.length,
+      identifiers: associatedSeats.map(
+        (seat) => seat.seat_identifier || `${seat.row}-${seat.seat_number}`,
+      ),
+    };
+  }
+
+  return { hasSeats: false };
+};
+
+// Instance method to update status
+hallSchema.methods.updateStatus = function (newStatus, updatedBy = null) {
+  const validStatuses = ["active", "maintenance", "closed", "renovation"];
+  if (!validStatuses.includes(newStatus)) {
+    throw new Error("Invalid status provided");
+  }
+
+  this.status = newStatus;
+  this.updatedBy = updatedBy;
+
+  return this.save();
+};
+
+// Instance method to calculate total capacity
+hallSchema.methods.calculateTotalCapacity = function () {
+  if (!this.capacity) return 0;
+
+  const {
+    standard = 0,
+    premium = 0,
+    vip = 0,
+    wheelchair = 0,
+    recliner = 0,
+  } = this.capacity;
+  return standard + premium + vip + wheelchair + recliner;
+};
+
+// Instance method to update capacity
+hallSchema.methods.updateCapacity = function (capacityUpdate) {
+  this.capacity = {
+    ...this.capacity,
+    ...capacityUpdate,
+  };
+
+  // Recalculate total seats
+  this.total_seats = this.calculateTotalCapacity();
+
+  return this.save();
+};
+
+// Static method to find halls by screen type
+hallSchema.statics.findByScreenType = function (screenType) {
+  return this.find({ screen_type: screenType, deletedAt: null });
+};
+
+// Static method to find active halls
+hallSchema.statics.findActive = function (query = {}) {
+  return this.find({
+    ...query,
+    deletedAt: null,
+    status: "active",
+  });
+};
+
+// Static method to find halls by theater
+hallSchema.statics.findByTheater = function (theaterId, query = {}) {
+  return this.find({
+    ...query,
+    theater_id: theaterId,
+    deletedAt: null,
+  });
+};
+
+// Static method to find deleted halls
+hallSchema.statics.findDeleted = function (query = {}) {
+  return this.find({
+    ...query,
+    deletedAt: { $ne: null },
+  });
+};
+
+// Static method to get halls with seat counts
+hallSchema.statics.getHallsWithSeatCounts = async function (query = {}) {
+  const Seat = mongoose.model("Seat");
+
+  return this.aggregate([
+    {
+      $match: {
+        ...query,
+        deletedAt: null,
+      },
+    },
+    {
+      $lookup: {
+        from: "seats",
+        let: { hallId: "$_id" },
+        pipeline: [
+          {
+            $match: {
+              $expr: {
+                $and: [
+                  { $eq: ["$hall_id", "$$hallId"] },
+                  { $eq: ["$deletedAt", null] },
+                ],
+              },
+            },
+          },
+          {
+            $group: {
+              _id: "$seat_type",
+              count: {
+                $sum: {
+                  $cond: {
+                    if: { $isArray: "$seat_number" },
+                    then: { $size: "$seat_number" },
+                    else: 1,
+                  },
+                },
+              },
+            },
+          },
+        ],
+        as: "actualSeats",
+      },
+    },
+    {
+      $addFields: {
+        actualCapacity: {
+          $arrayToObject: {
+            $map: {
+              input: "$actualSeats",
+              as: "seat",
+              in: {
+                k: "$$seat._id",
+                v: "$$seat.count",
+              },
+            },
+          },
+        },
+        actualTotalSeats: {
+          $sum: "$actualSeats.count",
+        },
+      },
+    },
+  ]);
+};
+
+// Static method to update total_seats for a hall based on actual seat count
+hallSchema.statics.updateTotalSeatsForHall = async function (hallId) {
+  logger.info(`updateTotalSeatsForHall called for hallId: ${hallId}`);
+  try {
+    const Seat = mongoose.model("Seat");
+
+    // Aggregate to correctly count seats, including multi-seat documents
+    const result = await Seat.aggregate([
+      {
+        $match: {
+          hall_id: new mongoose.Types.ObjectId(hallId), // Ensure hallId is ObjectId
+          deletedAt: null,
+        },
+      },
+      {
+        $group: {
+          _id: "$hall_id",
+          totalSeats: {
+            $sum: {
+              $cond: {
+                if: { $isArray: "$seat_number" },
+                then: { $size: "$seat_number" },
+                else: 1,
+              },
+            },
+          },
+        },
+      },
+    ]);
+
+    logger.info(`Aggregation result for hallId ${hallId}:`, result);
+
+    const seatCount = result.length > 0 ? result[0].totalSeats : 0;
+    logger.info(`Calculated seatCount for hallId ${hallId}: ${seatCount}`);
+
+    console.log(
+      `Attempting to update hall ${hallId} with total_seats: ${seatCount}`,
+    );
+    // Update the hall's total_seats field
+    const updatedHall = await this.findByIdAndUpdate(
+      hallId,
+      { total_seats: seatCount },
+      { new: true, timestamps: false }, // Don't update timestamps for auto-calculation
+    );
+    console.log(`Updated hall ${hallId}:`, updatedHall);
+
+    return seatCount;
+  } catch (error) {
+    logger.error(`Error updating total_seats for hall ${hallId}:`, error);
+    throw error;
+  }
+};
+
+// Static method to manually trigger recalculation for a specific hall
+hallSchema.statics.recalculateTotalSeats = async function (hallId) {
+  logger.info(
+    `Manual recalculation of total seats requested for Hall ID: ${hallId}`,
+  );
+  return await this.updateTotalSeatsForHall(hallId);
+};
+
+// Static method to manually trigger recalculation for all halls
+hallSchema.statics.recalculateAllHallTotalSeats = async function () {
+  logger.info("Manual recalculation of total seats requested for all halls...");
+  const halls = await this.find({}); // Get all halls
+  for (const hall of halls) {
+    await this.updateTotalSeatsForHall(hall._id);
+    logger.info(
+      `Updated total seats for Hall: ${hall.hall_name} (${hall._id})`,
+    );
+  }
+  logger.info("Finished recalculating total seats for all halls.");
+};
+
+// Virtual for display name
+hallSchema.virtual("display_name").get(function () {
+  return this.theater_id
+    ? `${this.theater_id} - ${this.hall_name}`
+    : this.hall_name;
+});
+
+// Virtual for status display
+hallSchema.virtual("status_display").get(function () {
+  if (this.isDeleted()) return "Deleted";
+  return (
+    this.status.charAt(0).toUpperCase() + this.status.slice(1).replace("_", " ")
+  );
+});
+
+// Virtual for capacity display
+hallSchema.virtual("capacity_display").get(function () {
+  const total = this.calculateTotalCapacity();
+  return `${total} seats`;
+});
+
+// Virtual for utilization percentage
+hallSchema.virtual("utilization_percentage").get(function () {
+  if (!this.total_seats) return 0;
+  const calculatedCapacity = this.calculateTotalCapacity();
+  return Math.round((calculatedCapacity / this.total_seats) * 100);
+});
+
+// Pre-save middleware
+hallSchema.pre("save", function (next) {
+  // Ensure hall_name is properly formatted
+  if (this.hall_name) {
+    this.hall_name = this.hall_name.trim();
+  }
+
+  // Set updatedBy for updates
+  if (this.isModified() && !this.isNew) {
+    this.updatedAt = new Date();
+  }
+
+  // Ensure deleted halls are not active
+  if (this.deletedAt && this.status === "active") {
+    this.status = "closed";
+  }
+
+  // For new halls, set total_seats to 0 initially (will be updated when seats are added)
+  if (this.isNew && !this.total_seats) {
+    this.total_seats = 0;
+  }
+
+  next();
+});
+// Pre-aggregate middleware to exclude deleted halls by default
+hallSchema.pre(
+  ["find", "findOne", "findOneAndUpdate", "count", "countDocuments"],
+  function () {
+    // Only apply if deletedAt filter is not already specified
+    if (!this.getQuery().hasOwnProperty("deletedAt")) {
+      this.where({ deletedAt: null });
+    }
+  },
+);
+// After a hall is created or updated
+hallSchema.post("save", async function () {
+  const Theater = mongoose.model("Theater");
+  const theater = await Theater.findById(this.theater_id);
+  if (theater) {
+    await theater.updateTotalHalls();
+  }
+});
+
+// After a hall is deleted
+hallSchema.post("findOneAndDelete", async function (doc) {
+  if (doc) {
+    const Theater = mongoose.model("Theater");
+    const theater = await Theater.findById(doc.theater_id);
+    if (theater) {
+      await theater.updateTotalHalls();
+    }
+  }
+});
+
+module.exports = mongoose.model("Hall", hallSchema);
